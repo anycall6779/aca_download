@@ -705,7 +705,7 @@ class App(tk.Tk):
         btn_row.pack(pady=(20, 24), padx=24, fill='x')
 
         tk.Button(btn_row, text='🌐  다운로드 페이지 열기',
-                  command=lambda: webbrowser.open('https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/'),
+                  command=lambda: webbrowser.open('https://developer.microsoft.com/ko-kr/microsoft-edge/tools/webdriver/'),
                   bg=self.ACCENT, fg='#fff', activebackground=self.ACCENT2,
                   font=('Segoe UI', 10, 'bold'),
                   relief='flat', cursor='hand2', padx=16, pady=8, bd=0
