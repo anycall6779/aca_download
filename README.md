@@ -7,6 +7,7 @@
 ## ✨ 주요 기능
 
 - **다중 URL 지원**: 여러 개의 게시글 주소를 한 번에 입력하여 순차적으로 다운로드할 수 있습니다.
+- **자동 로그인 (HTTP 451 차단 우회)**: 내장된 Edge 브라우저를 통해 아카라이브에 로그인하면 자동으로 쿠키를 수집하여 봇 감지(Cloudflare) 및 성인 인증 차단을 우회합니다.
 - **병렬 이미지 다운로드**: 멀티스레딩(ThreadPoolExecutor)을 사용하여 수십 장의 이미지도 순식간에 처리합니다.
 - **본문 보존**: `post.html` 파일을 생성하여 원문의 레이아웃과 이미지를 오프라인에서도 확인할 수 있게 합니다.
 - **메타데이터 저장**: `meta.txt`를 통해 제목, 작성자, 작성일, 원문 링크를 별도로 기록합니다.
@@ -17,17 +18,27 @@
 
 ### 1. 실행 파일 사용 (Windows)
 `dist/arca_downloader.exe` 파일을 실행하세요.
+- **로그인 기능 사용 시**: PC에 [Microsoft Edge](https://www.microsoft.com/ko-kr/edge) 브라우저가 설치되어 있어야 합니다.
+- (선택) 다운로드 받은 `msedgedriver.exe`를 실행 파일과 같은 폴더에 두면 더욱 빠르고 안정적으로 자동 로그인이 진행됩니다.
 
 ### 2. 소스 코드 실행
 Python 3.11 이상의 환경이 필요합니다.
 
 ```bash
 # 의존성 설치
-pip install requests bs4 lxml pillow
+pip install requests bs4 lxml pillow selenium webdriver-manager
 
 # 실행
 python arca_gui.py
 ```
+
+## 🔐 HTTP 451 (Unavailable For Legal Reasons) 해결 방법
+
+게시글 다운로드 중 HTTP 451 에러가 발생한다면 다음을 수행하세요:
+1. 프로그램 내의 **[🔑 아카라이브 로그인]** 버튼을 클릭합니다.
+2. Edge 브라우저가 열리면 아카라이브에 로그인합니다.
+3. 프로그램이 자동으로 로그인을 감지하고 브라우저를 닫은 뒤 인증 쿠키를 수집합니다. (✅ 로그인됨 상태 확인)
+4. 다시 **[⬇ 다운로드 시작]** 버튼을 누르면 정상적으로 다운로드됩니다.
 
 ## 🛠 빌드 방법 (EXE 생성)
 
@@ -44,9 +55,9 @@ pyinstaller --onefile --windowed --icon="arca_icon.ico" --add-data="arca_icon.pn
 - **Python**: 3.11+
 - **Libraries**:
   - `requests`: 웹 페이지 및 이미지 요청
-  - `beautifulsoup4`: HTML 파싱
-  - `lxml`: 빠른 파싱 엔진
+  - `beautifulsoup4`, `lxml`: HTML 파싱
   - `pillow`: 아이콘 및 이미지 처리 (GUI용)
+  - `selenium`, `webdriver-manager`: 브라우저 자동화 및 로그인 쿠키 자동 수집
 
 ## ⚠️ 주의 사항
 
@@ -57,4 +68,5 @@ pyinstaller --onefile --windowed --icon="arca_icon.ico" --add-data="arca_icon.pn
 ## 📄 라이선스
 
 이 프로젝트는 MIT 라이선스 하에 배포됩니다.
+
 원본 게시물인 https://arca.live/b/3d3d/148920327 에서 영감을 받았습니다.
