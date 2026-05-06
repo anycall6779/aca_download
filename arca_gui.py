@@ -35,9 +35,16 @@ ICON_PATH   = Path(__file__).parent / 'arca_icon.png'
 
 # ── 다운로드 로직 ─────────────────────────────────────────────────────────────
 
-def _make_session(base_url):
+def _make_session(base_url, cookie_str=''):
     s = requests.Session()
     s.headers.update({**DEFAULT_HEADERS, 'Referer': base_url})
+    # 쿠키 문자열 파싱: "key=val; key2=val2" 형태
+    if cookie_str.strip():
+        for pair in cookie_str.split(';'):
+            pair = pair.strip()
+            if '=' in pair:
+                k, v = pair.split('=', 1)
+                s.cookies.set(k.strip(), v.strip(), domain='arca.live')
     retry = Retry(total=2, backoff_factor=0,
                   status_forcelist={429,500,502,503,504},
                   allowed_methods={'GET'}, raise_on_status=False)
@@ -79,11 +86,18 @@ def fetch_image(session, src, log):
             log(f'    [WARN] 실패: {e}')
         return None
 
-def download_article(url, output_dir, log, set_progress, on_done, on_error):
+def download_article(url, output_dir, log, set_progress, on_done, on_error, cookie_str=''):
     try:
-        session = _make_session(url)
+        session = _make_session(url, cookie_str=cookie_str)
         log(f'[*] 요청: {url}')
-        resp = session.get(url, timeout=10); resp.raise_for_status()
+        if cookie_str.strip():
+            log('    (쿠키 인증 사용 중)')
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 451:
+            on_error(f'HTTP 451: 법적 사유로 차단된 페이지입니다.\n'
+                     f'유효한 아카라이브 로그인 쿠키를 입력해야 접근할 수 있습니다.')
+            return
+        resp.raise_for_status()
         resp.encoding = 'utf-8'
         soup = BeautifulSoup(resp.text, 'lxml')
 
@@ -293,12 +307,60 @@ class App(tk.Tk):
         self._url_container.pack(fill='x', padx=14, pady=(0,12))
         self._add_url_row()   # 첫 행
 
+        # ── 엄카라이브 로그인 섹션 ──────────────────────────────────
+        self._section_label(outer, '아카라이브 로그인 (선택 — HTTP 451 차단 우회)')
+
+        cookie_card = tk.Frame(outer, bg=self.CARD,
+                               highlightbackground=self.BORDER, highlightthickness=1)
+        cookie_card.pack(fill='x', pady=(4,16))
+
+        ck_row = tk.Frame(cookie_card, bg=self.CARD)
+        ck_row.pack(fill='x', padx=14, pady=14)
+
+        # 상태 표시 라벨
+        self.login_status_var = tk.StringVar(value='⚪  미로그인')
+        self.login_status_lbl = tk.Label(
+            ck_row, textvariable=self.login_status_var,
+            bg=self.CARD, fg=self.MUTED,
+            font=('Segoe UI', 10, 'bold'), width=22, anchor='w'
+        )
+        self.login_status_lbl.pack(side='left')
+
+        # 로그인 버튼
+        self.login_btn = tk.Button(
+            ck_row, text='🔑  아카라이브 로그인',
+            command=self._do_login,
+            bg=self.ACCENT, fg='#ffffff',
+            activebackground=self.ACCENT2, activeforeground='#ffffff',
+            font=('Segoe UI', 10, 'bold'),
+            relief='flat', cursor='hand2', padx=14, pady=6, bd=0
+        )
+        self.login_btn.pack(side='left', padx=(0, 8))
+
+        # 상태 초기화 버튼
+        tk.Button(
+            ck_row, text='삭제',
+            command=self._clear_login,
+            bg=self.INPUT, fg=self.MUTED,
+            activebackground=self.BORDER, activeforeground=self.TEXT,
+            font=('Segoe UI', 9),
+            relief='flat', cursor='hand2', padx=10, pady=6, bd=0
+        ).pack(side='left')
+
+        self.cookie_var = tk.StringVar()  # 내부 쿠키 저장용 (UI에 직접 표시 안 함)
+
+        tk.Label(cookie_card,
+                 text='  ℹ️  로그인 버튼을 클릭하면 브라우저 창이 열립니다. 로그인 완료 시 쿠키를 자동으로 가져옵니다.',
+                 bg=self.CARD, fg=self.MUTED, font=('Segoe UI', 8),
+                 justify='left'
+                 ).pack(anchor='w', padx=14, pady=(0, 10))
+
         # ── 저장 위치 ─────────────────────────────────────────────────────
         self._section_label(outer, '저장 위치')
 
         dir_card = tk.Frame(outer, bg=self.CARD,
                             highlightbackground=self.BORDER, highlightthickness=1)
-        dir_card.pack(fill='x', pady=(4,20))
+        dir_card.pack(fill='x', pady=(4,16))
 
         dir_row = tk.Frame(dir_card, bg=self.CARD)
         dir_row.pack(fill='x', padx=14, pady=12)
@@ -420,6 +482,241 @@ class App(tk.Tk):
         try: return self.clipboard_get().strip()
         except: return ''
 
+    def _set_login_status(self, text, color):
+        def _u():
+            self.login_status_var.set(text)
+            self.login_status_lbl.configure(fg=color)
+        self.after(0, _u)
+
+    def _clear_login(self):
+        self.cookie_var.set('')
+        self._set_login_status('⚪  미로그인', self.MUTED)
+        self._log('[*] 로그인 정보 삭제됨')
+
+    def _do_login(self):
+        """Selenium 브라우저를 열어 로그인 후 쿠키 자동 수집."""
+        if self.cookie_var.get():
+            if not messagebox.askyesno('재로그인', '이미 로그인되어 있습니다.\n다시 로그인하시겠습니까?'):
+                return
+
+        self.login_btn.configure(state='disabled', text='브라우저 열는 중...')
+        self._set_login_status('⏳  로그인 대기 중', '#fbbf24')
+        self._log('[*] 아카라이브 로그인 브라우저 열기 중...')
+
+        def _run():
+            try:
+                driver = self._open_browser('https://arca.live/u/login')
+            except RuntimeError as e:
+                _e = str(e)
+                self.after(0, lambda msg=_e: (
+                    self._set_login_status('❌  브라우저 오류', self.ERROR),
+                    self._log(f'[✗] {msg}'),
+                    self.login_btn.configure(state='normal', text='🔑  아카라이브 로그인')
+                ))
+                return
+
+            self.after(0, lambda: (
+                self._log('[*] 브라우저에서 로그인하시면 자동으로 쿠키를 가져옵니다.'),
+            ))
+
+            import time
+            LOGIN_URL = 'https://arca.live/u/login'
+            try:
+                for _ in range(180):   # 최대 6분 대기
+                    time.sleep(2)
+                    try:
+                        current = driver.current_url
+                    except Exception:
+                        break   # 브라우저 종료됨
+                    # 로그인 성공 = /u/login 에서 다른 곳으로 리다이렉트
+                    if 'login' not in current:
+                        time.sleep(1)  # 쿠키 정착 대기
+                        raw = driver.get_cookies()
+                        cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in raw)
+                        n = len(raw)
+                        def _ok(cs=cookie_str, n=n):
+                            self.cookie_var.set(cs)
+                            self._set_login_status(f'✅  로그인됨 ({n}개)', self.SUCCESS)
+                            self._log(f'[✓] 쿠키 {n}개 수집 완료 — 이제 다운로드하세요!')
+                            self.login_btn.configure(state='normal', text='🔑  다시 로그인')
+                        self.after(0, _ok)
+                        time.sleep(2)
+                        break
+                else:
+                    self.after(0, lambda: (
+                        self._set_login_status('⏰  시간 초과', self.ERROR),
+                        self._log('[⚠] 6분 내 로그인 감지 실패. 다시 시도해주세요.'),
+                        self.login_btn.configure(state='normal', text='🔑  아카라이브 로그인')
+                    ))
+            finally:
+                try: driver.quit()
+                except: pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _open_browser(self, url: str):
+        """Edge를 Cloudflare 우회 모드로 열고 driver 반환."""
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.edge.options import Options as EO
+            from selenium.webdriver.edge.service import Service as ES
+        except ImportError:
+            raise RuntimeError(
+                'selenium 패키지가 필요합니다.\n'
+                '터미널: pip install selenium'
+            )
+
+        opts = EO()
+        # ── Cloudflare 봇 감지 우회 ────────────────────────────────────
+        opts.add_argument('--disable-blink-features=AutomationControlled')
+        opts.add_experimental_option('excludeSwitches', ['enable-automation'])
+        opts.add_experimental_option('useAutomationExtension', False)
+
+        # ── 기존 Edge 프로필 재사용 (Cloudflare 신뢰도 ↑) ────────────────
+        edge_profile = Path.home() / 'AppData' / 'Local' / 'Microsoft' / 'Edge' / 'User Data'
+        if edge_profile.exists():
+            opts.add_argument(f'--user-data-dir={edge_profile}')
+            opts.add_argument('--profile-directory=Default')
+
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--disable-dev-shm-usage')
+        opts.add_argument('--start-maximized')
+
+        # ── 드라이버 탐색 순서 ─────────────────────────────────────────
+        driver = None
+        last_err = ''
+
+        # 스크립트 폴더 포함 탐색 경로 목록
+        script_dir = str(Path(__file__).parent / 'msedgedriver.exe')
+        search_paths = [
+            None,          # PATH 자동 탐색
+            script_dir,    # 스크립트와 같은 폴더 ← 우선 탐색
+            str(Path.home() / 'Downloads' / 'msedgedriver.exe'),
+            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedgedriver.exe',
+            r'C:\Program Files\Microsoft\Edge\Application\msedgedriver.exe',
+        ]
+
+        def _try_start(options):
+            """주어진 options으로 드라이버 목록을 순서대로 시도."""
+            for drv_path in search_paths:
+                try:
+                    svc = ES(drv_path) if drv_path else ES()
+                    return webdriver.Edge(service=svc, options=options)
+                except Exception as e:
+                    nonlocal last_err
+                    last_err = str(e)
+            return None
+
+        # 1차 시도: 기존 Edge 프로필 포함
+        driver = _try_start(opts)
+
+        # 2차 시도: 프로필 충돌 가능성 → 프로필 없이 재시도
+        if driver is None:
+            opts_no_profile = EO()
+            opts_no_profile.add_argument('--disable-blink-features=AutomationControlled')
+            opts_no_profile.add_experimental_option('excludeSwitches', ['enable-automation'])
+            opts_no_profile.add_experimental_option('useAutomationExtension', False)
+            opts_no_profile.add_argument('--no-sandbox')
+            opts_no_profile.add_argument('--disable-dev-shm-usage')
+            opts_no_profile.add_argument('--start-maximized')
+            driver = _try_start(opts_no_profile)
+
+        # 3차 시도: webdriver_manager (네트워크 필요)
+        if driver is None:
+            try:
+                from webdriver_manager.microsoft import EdgeChromiumDriverManager
+                svc = ES(EdgeChromiumDriverManager().install())
+                driver = webdriver.Edge(service=svc, options=opts)
+            except Exception as e:
+                last_err = str(e)
+
+        if driver is None:
+            self.after(0, self._show_edgedriver_guide)
+            raise RuntimeError(
+                f'msedgedriver를 찾을 수 없습니다.\n'
+                f'설치 안내 창을 확인해주세요.\n({last_err})'
+            )
+
+        # ── navigator.webdriver 숨김 (Cloudflare JS 감지 우회) ───────────
+        stealth_js = """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR','ko','en-US','en']});
+            window.chrome = {runtime: {}};
+        """
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': stealth_js})
+        driver.get(url)
+        return driver
+
+    def _show_edgedriver_guide(self):
+        """msedgedriver 설치 안내 팝업."""
+        import webbrowser
+
+        # Edge 버전 자동 감지
+        edge_ver = '알 수 없음'
+        try:
+            import subprocess, re
+            out = subprocess.check_output(
+                r'reg query "HKEY_CURRENT_USER\SOFTWARE\Microsoft\Edge\BLBeacon" /v version',
+                shell=True, stderr=subprocess.DEVNULL
+            ).decode()
+            m = re.search(r'(\d+\.\d+\.\d+\.\d+)', out)
+            if m:
+                edge_ver = m.group(1)
+        except Exception:
+            pass
+
+        guide = tk.Toplevel(self)
+        guide.title('Edge WebDriver 설치 안내')
+        guide.configure(bg=self.BG)
+        guide.resizable(False, False)
+        guide.grab_set()
+
+        tk.Label(guide, text='⚙️  Edge WebDriver 설치가 필요합니다',
+                 bg=self.BG, fg=self.TEXT,
+                 font=('Segoe UI', 13, 'bold')).pack(pady=(24, 6), padx=24)
+
+        tk.Label(guide,
+                 text=f'감지된 Edge 버전:  {edge_ver}',
+                 bg=self.BG, fg=self.MUTED,
+                 font=('Segoe UI', 10)).pack(pady=(0, 16), padx=24)
+
+        script_dir = str(Path(__file__).parent)
+        steps = [
+            ('1', '아래 버튼을 눌러 Microsoft Edge WebDriver 다운로드 페이지를 여세요.'),
+            ('2', f'현재 Edge 버전({edge_ver})과 동일한 버전의 드라이버를 다운로드하세요.'),
+            ('3', '다운받은 msedgedriver.exe를 아래 위치 중 한 곳에 저장하세요:'),
+            ('',  f'   ✅ 가장 쉬운 방법: {script_dir}\\  (프로그램과 같은 폴더)'),
+            ('',  '   • C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\'),
+            ('',  '   • 또는 사용자 다운로드 폴더 (~/Downloads/)'),
+            ('4', '저장 후 이 프로그램을 재실행하고 로그인 버튼을 다시 눌러주세요.'),
+        ]
+
+        for num, text in steps:
+            row = tk.Frame(guide, bg=self.BG)
+            row.pack(fill='x', padx=24, pady=2, anchor='w')
+            if num:
+                tk.Label(row, text=f' {num} ', bg=self.ACCENT, fg='#fff',
+                         font=('Segoe UI', 9, 'bold'), width=2).pack(side='left', padx=(0, 8))
+            tk.Label(row, text=text, bg=self.BG, fg=self.TEXT,
+                     font=('Segoe UI', 9), justify='left', anchor='w').pack(side='left', fill='x')
+
+        btn_row = tk.Frame(guide, bg=self.BG)
+        btn_row.pack(pady=(20, 24), padx=24, fill='x')
+
+        tk.Button(btn_row, text='🌐  다운로드 페이지 열기',
+                  command=lambda: webbrowser.open('https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/'),
+                  bg=self.ACCENT, fg='#fff', activebackground=self.ACCENT2,
+                  font=('Segoe UI', 10, 'bold'),
+                  relief='flat', cursor='hand2', padx=16, pady=8, bd=0
+                  ).pack(side='left', padx=(0, 8))
+
+        tk.Button(btn_row, text='닫기', command=guide.destroy,
+                  bg=self.INPUT, fg=self.MUTED,
+                  font=('Segoe UI', 10),
+                  relief='flat', cursor='hand2', padx=16, pady=8, bd=0
+                  ).pack(side='left')
+
     # ── 핸들러 ───────────────────────────────────────────────────────────────
 
     def _browse_dir(self):
@@ -463,8 +760,9 @@ class App(tk.Tk):
     def _start_download(self):
         if self._downloading: return
 
-        urls = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
-        out  = self.dir_var.get().strip()
+        urls       = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
+        out        = self.dir_var.get().strip()
+        cookie_str = self.cookie_var.get().strip()
 
         if not urls:
             messagebox.showwarning('입력 필요','URL을 하나 이상 입력해주세요.'); return
@@ -477,6 +775,8 @@ class App(tk.Tk):
         self._clear_log()
         self._set_progress(0,0)
         self.prog_label.configure(text='')
+        if cookie_str:
+            self._log(f'[*] 쿠키 인증 활성화 ({len(cookie_str)}자)')
         self._set_dl(True)
 
         total_n  = len(urls)
@@ -508,7 +808,8 @@ class App(tk.Tk):
         def _run():
             for url in urls:
                 self._log(f'\n── {url}')
-                download_article(url, out, self._log, self._set_progress, _done, _err)
+                download_article(url, out, self._log, self._set_progress,
+                                 _done, _err, cookie_str=cookie_str)
 
         threading.Thread(target=_run, daemon=True).start()
 
