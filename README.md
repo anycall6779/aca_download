@@ -57,3 +57,4 @@ pyinstaller --onefile --windowed --icon="arca_icon.ico" --add-data="arca_icon.pn
 ## 📄 라이선스
 
 이 프로젝트는 MIT 라이선스 하에 배포됩니다.
+원본 게시물인 https://arca.live/b/3d3d/148920327 에서 영감을 받았습니다.
