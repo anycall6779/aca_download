@@ -2,11 +2,11 @@
 arca_gui.py — 아카라이브 게시글 ZIP 저장기 (GUI, 다중 URL)
 """
 
-import io, re, copy, zipfile, threading, base64, os
+import io, re, copy, zipfile, threading, base64, os, time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -30,8 +30,10 @@ DEFAULT_HEADERS = {
                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
     'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
 }
-MAX_WORKERS = 10
-ICON_PATH   = Path(__file__).parent / 'arca_icon.png'
+MAX_WORKERS   = 3   # 미리보기 화질: 이미지 병렬 수
+FETCH_RETRY   = 10  # ArcaRefresher fetchWithRetry tryCount
+FETCH_WAIT    = 1.0 # ArcaRefresher fetchWithRetry interval (1초)
+ICON_PATH     = Path(__file__).parent / 'arca_icon.png'
 
 # ── 다운로드 로직 ─────────────────────────────────────────────────────────────
 
@@ -45,7 +47,7 @@ def _make_session(base_url, cookie_str=''):
             if '=' in pair:
                 k, v = pair.split('=', 1)
                 s.cookies.set(k.strip(), v.strip(), domain='arca.live')
-    retry = Retry(total=2, backoff_factor=0,
+    retry = Retry(total=5, backoff_factor=1,
                   status_forcelist={429,500,502,503,504},
                   allowed_methods={'GET'}, raise_on_status=False)
     adp = HTTPAdapter(max_retries=retry,
@@ -68,25 +70,101 @@ def get_image_ext(src):
 def escape_html(s):
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
 
-def fetch_image(session, src, log):
-    try:
-        r = session.get(src, timeout=10); r.raise_for_status(); return r.content
-    except Exception as e:
-        parsed = urlparse(src)
-        if parsed.hostname and parsed.hostname.endswith('namu.la'):
-            try:
-                proxy = ('https://images.weserv.nl/?url='
-                         + parsed.hostname + parsed.path
-                         + (('?'+parsed.query) if parsed.query else ''))
-                r2 = session.get(proxy, timeout=10); r2.raise_for_status()
-                log('    (namu.la → weserv.nl 프록시 성공)'); return r2.content
-            except Exception as e2:
-                log(f'    [WARN] 프록시 실패: {e2}')
-        else:
-            log(f'    [WARN] 실패: {e}')
-        return None
+# ── ArcaRefresher ImageDownloader 이식 ────────────────────────────────────────────
+#
+# ImageInfo.jsx 핵심 로직 이식:
+#  1. URL = data-originalurl → data-src → src 순서로 탐색
+#  2. 원본 URL 구성: ac-o.namu.la 호스트 + type=orig 파라미터
+#  3. JPG 속도 최적화: 너비 ≤1280px JPG/JPEG는 미리보기 URL 사용
+#
+# DownloadDialog.jsx 핵심 로직 이식:
+#  • 스트리밍 순차 다운로드 (highWaterMark: 0, 이미지 1개씩)
+#  • fetchWithRetry — 실패 시 1초 간격으로 최대 10회 재시도
 
-def download_article(url, output_dir, log, set_progress, on_done, on_error, cookie_str=''):
+def get_arcaimg_url(img_tag, base_url, download_original=True):
+    """ArcaRefresher ImageInfo.jsx 이식.
+    data-originalurl → data-src → src 순서로 URL 결정 후
+    필요 시 ac-o.namu.la + type=orig 적용.
+    JPG 너비 ≤1280px 수도 최적화 제외."""
+    raw = img_tag.get('data-originalurl') or img_tag.get('data-src') or img_tag.get('src', '')
+    if not raw:
+        return ''
+    try:
+        src = urljoin(base_url, raw)
+        parsed = urlparse(src)
+        ext = parsed.path.rsplit('.', 1)[-1].lower().split('?')[0] if '.' in parsed.path else ''
+
+        if not download_original:
+            return src
+
+        # JPG 속도 최적화: 너비 ≤1280px인 JPG/JPEG는 미리보기 URL 그대로 사용
+        if ext in ('jpg', 'jpeg'):
+            try:
+                width = int(img_tag.get('width') or 0)
+            except (ValueError, TypeError):
+                width = 0
+            if width <= 1280 and width > 0:  # 너비 정보가 있는 소형 JPG
+                return src  # 미리보기 사용 (속도 최적화)
+
+        # ac-o.namu.la + type=orig 적용
+        if any(d in parsed.netloc for d in ('namu.la', 'arca.live')):
+            netloc = 'ac-o.namu.la'
+            qs = parse_qs(parsed.query)
+            qs['type'] = ['orig']
+            return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params,
+                               urlencode(qs, doseq=True), parsed.fragment))
+        return src
+    except Exception:
+        return raw
+
+
+def fetch_image(session, src, log, chunk_cb=None, stop_event=None, pause_event=None):
+    """ArcaRefresher fetchWithRetry 이식.
+    스트리밍 순차 다운로드, 실패 시 1초 간격으로 최대 10회 재시도.
+    chunk_cb(downloaded, total)  — 청크마다 호출되는 진행 콜백
+    stop_event / pause_event     — threading.Event 중지/일시정지 신호"""
+    for attempt in range(1, FETCH_RETRY + 1):
+        # 중지 신호 확인
+        if stop_event and stop_event.is_set():
+            return None
+        try:
+            with session.get(src, timeout=60, stream=True) as r:
+                if r.status_code == 429:
+                    log(f'    [WARN] 429 — {FETCH_WAIT}s 대기 재시도 ({attempt}/{FETCH_RETRY})')
+                    time.sleep(FETCH_WAIT)
+                    continue
+                r.raise_for_status()
+
+                # Content-Length 확인 (없으면 -1)
+                total_bytes = int(r.headers.get('Content-Length', -1))
+                buf = bytearray()
+                for chunk in r.iter_content(8192):
+                    # 일시정지 대기
+                    if pause_event:
+                        while pause_event.is_set() and not (stop_event and stop_event.is_set()):
+                            time.sleep(0.1)
+                    # 중지
+                    if stop_event and stop_event.is_set():
+                        return None
+                    buf.extend(chunk)
+                    if chunk_cb:
+                        chunk_cb(len(buf), total_bytes)
+                return bytes(buf)
+        except Exception as e:
+            if stop_event and stop_event.is_set():
+                return None
+            if attempt < FETCH_RETRY:
+                log(f'    [WARN] 실패: {e} — {FETCH_WAIT}s 후 재시도 ({attempt}/{FETCH_RETRY})')
+                time.sleep(FETCH_WAIT)
+            else:
+                log(f'    [WARN] 최종 실패 ({FETCH_RETRY}회): {e}')
+    return None
+
+
+def download_article(url, output_dir, log, set_progress, on_done, on_error,
+                     cookie_str='', download_original=True,
+                     set_img_progress=None, set_total_eta=None,
+                     stop_event=None, pause_event=None):
     try:
         session = _make_session(url, cookie_str=cookie_str)
         log(f'[*] 요청: {url}')
@@ -134,12 +212,18 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error, cook
         for sel in STRIP_SELECTORS:
             for el in content.select(sel): el.decompose()
         for img in content.find_all('img'):
-            if not img.get('src') and img.get('data-src'):
+            resolved = get_arcaimg_url(img, url, download_original=download_original)
+            if resolved:
+                img['src'] = resolved
+            elif not img.get('src') and img.get('data-src'):
                 img['src'] = img['data-src']
 
         imgs  = [i for i in content.find_all('img') if i.get('src')]
         total = len(imgs)
-        log(f'[*] 이미지 {total}개 다운로드 (워커 {min(MAX_WORKERS,max(total,1))}개)...')
+        if download_original:
+            log(f'[*] 이미지 {total}개 순차 다운로드 (ArcaRefresher 방식, 최대 {FETCH_RETRY}회 재시도)...')
+        else:
+            log(f'[*] 이미지 {total}개 다운로드 (워커 {min(MAX_WORKERS,max(total,1))}개)...')
         set_progress(0, total)
 
         tasks = []
@@ -152,20 +236,90 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error, cook
         done_n  = 0
         lock    = threading.Lock()
 
-        def _dl(task):
-            nonlocal done_n
-            idx, img, src, name = task
-            log(f'  [{idx:03d}/{total}] {src}')
-            data = fetch_image(session, src, log)
-            if not data: log('       → 건너뜀')
-            with lock:
-                done_n += 1; set_progress(done_n, total)
-            return idx, name, data
-
         zip_buf = io.BytesIO(); downloaded = []
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS,max(total,1))) as pool:
-            for fut in as_completed({pool.submit(_dl,t):t[0] for t in tasks}):
-                idx, name, data = fut.result(); results[idx] = (name, data)
+
+        if download_original:
+            # 원본 화질: 순차 다운로드 (429 방지)
+            global_start     = time.time()        # 전체 다운 시작
+            completed_sizes  = []                  # 완료된 이미지 바이트 크기
+
+            for task in tasks:
+                if stop_event and stop_event.is_set():
+                    on_error('사용자가 다운로드를 중지했습니다.')
+                    return
+                idx, img, src, name = task
+                log(f'  [{idx:03d}/{total}] {src}')
+
+                img_start_time = time.time()
+                speed_bps      = [0.0]
+
+                def _chunk_cb(dl_bytes, total_b,
+                              _img_start=img_start_time, _speed=speed_bps,
+                              _idx=idx):
+                    elapsed_img = time.time() - _img_start
+                    if elapsed_img > 0:
+                        _speed[0] = dl_bytes / elapsed_img
+                    # 이미지 1개 ETA
+                    if set_img_progress:
+                        set_img_progress(dl_bytes, total_b, _speed[0])
+                    # 전체 ETA — 완료 이미지 평균 크기 기반
+                    if set_total_eta and total_b > 0:
+                        elapsed_total = time.time() - global_start
+                        n_done = len(completed_sizes)
+                        fraction = dl_bytes / total_b           # 현재 이미지 진행 비율
+                        total_dl = sum(completed_sizes) + dl_bytes
+                        imgs_done_equiv = n_done + fraction     # 실효 완료량 (1.0 = 1개)
+                        if elapsed_total > 0 and imgs_done_equiv > 0:
+                            avg_img_size  = total_dl / imgs_done_equiv
+                            overall_speed = total_dl / elapsed_total
+                            remaining     = (total - _idx + 1 - fraction) * avg_img_size
+                            set_total_eta(remaining / overall_speed if overall_speed > 0 else 0)
+
+                data = fetch_image(session, src, log,
+                                   chunk_cb=_chunk_cb,
+                                   stop_event=stop_event,
+                                   pause_event=pause_event)
+                if stop_event and stop_event.is_set():
+                    on_error('사용자가 다운로드를 중지했습니다.')
+                    return
+                if data:
+                    completed_sizes.append(len(data))
+                else:
+                    log('       → 건너뜀')
+                results[idx] = (name, data)
+                done_n += 1
+                set_progress(done_n, total)
+                if set_img_progress:
+                    set_img_progress(0, 0, 0)  # 다음 이미지 전 리셋
+
+
+        else:
+            # 미리보기 화질: 병렬 다운로드
+            last_request_time = 0
+            time_lock = threading.Lock()
+
+            def _dl(task):
+                nonlocal done_n, last_request_time
+                idx, img, src, name = task
+                with time_lock:
+                    now = time.time()
+                    elapsed = now - last_request_time
+                    wait_time = 0.5 - elapsed
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+                    last_request_time = time.time()
+
+                log(f'  [{idx:03d}/{total}] {src}')
+                data = fetch_image(session, src, log)
+                if not data:
+                    log('       → 건너뜀')
+                with lock:
+                    done_n += 1; set_progress(done_n, total)
+                return idx, name, data
+
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS,max(total,1))) as pool:
+                for fut in as_completed({pool.submit(_dl,t):t[0] for t in tasks}):
+                    idx, name, data = fut.result(); results[idx] = (name, data)
 
         with zipfile.ZipFile(zip_buf,'w',zipfile.ZIP_DEFLATED) as zf:
             for idx, img in enumerate(imgs,1):
@@ -228,8 +382,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('아카라이브 다운로더')
-        self.geometry('780x720')
-        self.minsize(640, 560)
+        self.geometry('780x850')
+        self.minsize(640, 600)
         self.configure(bg=self.BG)
         self.resizable(True, True)
 
@@ -246,6 +400,8 @@ class App(tk.Tk):
         self._url_rows: list[tuple] = []
         self._url_container = None
         self._downloading   = False
+        self._stop_event    = threading.Event()   # 중지
+        self._pause_event   = threading.Event()   # 수동: set=일시정지, clear=재개
 
         self._build_styles()
         self._build_ui()
@@ -260,7 +416,10 @@ class App(tk.Tk):
         s.configure('TLabel',       background=self.BG,    foreground=self.TEXT,  font=('Segoe UI',10))
         s.configure('H1.TLabel',    background=self.BG,    foreground=self.TEXT,  font=('Segoe UI',17,'bold'))
         s.configure('Muted.TLabel', background=self.BG,    foreground=self.MUTED, font=('Segoe UI',9))
-        s.configure('TProgressbar', troughcolor=self.PANEL, background=self.ACCENT, thickness=4, borderwidth=0)
+        s.configure('TProgressbar',     troughcolor=self.PANEL, background=self.ACCENT,  thickness=4,  borderwidth=0)
+        s.configure('Sub.TProgressbar', troughcolor=self.PANEL, background=self.SUCCESS, thickness=6,  borderwidth=0)
+        # 레이아웃을 TProgressbar에서 복사 (없으면 'Horizontal.Sub.TProgressbar not found' 오류)
+        s.layout('Sub.TProgressbar', s.layout('Horizontal.TProgressbar'))
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -374,23 +533,106 @@ class App(tk.Tk):
         self._btn(dir_row, '📂  폴더 선택', self._browse_dir,
                   bg=self.ACCENT, side='left')
 
-        # ── 다운로드 버튼 ─────────────────────────────────────────────────
-        self.dl_btn = tk.Button(outer, text='⬇   다운로드 시작',
-                                command=self._start_download,
-                                bg=self.ACCENT, fg='#ffffff',
-                                activebackground=self.ACCENT2, activeforeground='#ffffff',
-                                font=('Segoe UI',12,'bold'),
-                                relief='flat', cursor='hand2',
-                                pady=13, padx=20, bd=0)
-        self.dl_btn.pack(fill='x', pady=(0,14))
+        # ── 다운로드 설정 ─────────────────────────────────────────────────
+        self._section_label(outer, '다운로드 설정')
 
-        # ── 진행바 ───────────────────────────────────────────────────────
+        settings_card = tk.Frame(outer, bg=self.CARD,
+                                 highlightbackground=self.BORDER, highlightthickness=1)
+        settings_card.pack(fill='x', pady=(4,16))
+
+        settings_row = tk.Frame(settings_card, bg=self.CARD)
+        settings_row.pack(fill='x', padx=14, pady=12)
+
+        self.orig_img_var = tk.BooleanVar(value=True)
+        self.orig_img_cb = tk.Checkbutton(
+            settings_row,
+            text='🖼️  이미지 원본 다운로드 (체크 해제 시 미리보기 화질로 다운로드)',
+            variable=self.orig_img_var,
+            bg=self.CARD,
+            fg=self.TEXT,
+            selectcolor=self.INPUT,
+            activebackground=self.CARD,
+            activeforeground=self.TEXT,
+            font=('Segoe UI', 10),
+            relief='flat',
+            bd=0,
+            cursor='hand2'
+        )
+        self.orig_img_cb.pack(side='left')
+
+        # ── 다운로드 제어 행 (시작 + 일시정지 + 중지) ──────────────────────
+        ctrl_bar = tk.Frame(outer, bg=self.BG)
+        ctrl_bar.pack(fill='x', pady=(0, 10))
+
+        self.dl_btn = tk.Button(
+            ctrl_bar, text='⬇   다운로드 시작',
+            command=self._start_download,
+            bg=self.ACCENT, fg='#ffffff',
+            activebackground=self.ACCENT2, activeforeground='#ffffff',
+            font=('Segoe UI', 11, 'bold'),
+            relief='flat', cursor='hand2', pady=10, padx=16, bd=0
+        )
+        self.dl_btn.pack(side='left', fill='x', expand=True, padx=(0, 8))
+
+        self.pause_btn = tk.Button(
+            ctrl_bar, text='⏸  일시정지',
+            command=self._toggle_pause,
+            bg=self.WARN, fg='#1a1d2a',
+            activebackground='#e6b800', activeforeground='#1a1d2a',
+            font=('Segoe UI', 9, 'bold'),
+            relief='flat', cursor='hand2', padx=10, pady=16, bd=0, state='disabled'
+        )
+        self.pause_btn.pack(side='left', padx=(0, 6))
+
+        self.stop_btn = tk.Button(
+            ctrl_bar, text='⏹  중지',
+            command=self._stop_download,
+            bg=self.DEL_C, fg='#ffffff',
+            activebackground='#d9364a', activeforeground='#ffffff',
+            font=('Segoe UI', 9, 'bold'),
+            relief='flat', cursor='hand2', padx=10, pady=16, bd=0, state='disabled'
+        )
+        self.stop_btn.pack(side='left')
+
+        # ── 진행 파널 (2줄 콤팩트) ──────────────────────────────────
+        prog_card = tk.Frame(outer, bg=self.CARD,
+                             highlightbackground=self.BORDER, highlightthickness=1)
+        prog_card.pack(fill='x', pady=(0, 8))
+
+        # 전체 현황 행
+        row_total = tk.Frame(prog_card, bg=self.CARD)
+        row_total.pack(fill='x', padx=14, pady=(8, 3))
+        tk.Label(row_total, text='전체', bg=self.CARD, fg=self.MUTED,
+                 font=('Segoe UI', 8, 'bold'), width=4, anchor='w').pack(side='left')
         self.prog_var = tk.DoubleVar(value=0)
-        ttk.Progressbar(outer, variable=self.prog_var,
-                        maximum=100, style='TProgressbar').pack(fill='x')
-        self.prog_label = tk.Label(outer, text='', bg=self.BG, fg=self.MUTED,
-                                   font=('Segoe UI',9))
-        self.prog_label.pack(anchor='e', pady=(3,10))
+        ttk.Progressbar(row_total, variable=self.prog_var,
+                        maximum=100, style='TProgressbar').pack(side='left', fill='x', expand=True, padx=(6, 8))
+        self.total_eta_label = tk.Label(row_total, text='', bg=self.CARD, fg=self.MUTED,
+                                        font=('Segoe UI', 8))
+        self.total_eta_label.pack(side='right')
+        self.prog_label = tk.Label(row_total, text='', bg=self.CARD, fg=self.MUTED,
+                                   font=('Segoe UI', 8), width=14, anchor='e')
+        self.prog_label.pack(side='right', padx=(0, 6))
+
+        # 현재 이미지 행 (프로그레스 + KB 표시 + 속도 + ETA 한 행)
+        row_img = tk.Frame(prog_card, bg=self.CARD)
+        row_img.pack(fill='x', padx=14, pady=(0, 8))
+        tk.Label(row_img, text='이미지', bg=self.CARD, fg=self.MUTED,
+                 font=('Segoe UI', 8, 'bold'), width=4, anchor='w').pack(side='left')
+        self.sub_prog_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(row_img, variable=self.sub_prog_var,
+                        maximum=100, style='Sub.TProgressbar').pack(side='left', fill='x', expand=True, padx=(6, 8))
+        self.eta_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
+                                  font=('Segoe UI', 8))
+        self.eta_label.pack(side='right')
+        self.speed_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
+                                    font=('Segoe UI', 8))
+        self.speed_label.pack(side='right', padx=(0, 6))
+        self.sub_prog_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
+                                       font=('Segoe UI', 8), width=16, anchor='e')
+        self.sub_prog_label.pack(side='right', padx=(0, 4))
+
+
 
         # ── 로그 ─────────────────────────────────────────────────────────
         log_top = tk.Frame(outer, bg=self.BG)
@@ -742,8 +984,69 @@ class App(tk.Tk):
 
     def _set_progress(self, cur, tot):
         def _u():
-            self.prog_var.set((cur/tot*100) if tot else 0)
+            self.prog_var.set((cur / tot * 100) if tot else 0)
             self.prog_label.configure(text=f'{cur} / {tot} 이미지' if tot else '')
+            if not tot or cur >= tot:
+                self.total_eta_label.configure(text='')
+        self.after(0, _u)
+
+    @staticmethod
+    def _fmt_eta(eta_s):
+        """ETA 초 → 인간 읽기 좋은 문자열."""
+        eta_s = max(0, eta_s)
+        if eta_s >= 3600:
+            h = int(eta_s // 3600)
+            m = int((eta_s % 3600) // 60)
+            return f'{h}시간 {m}분'
+        elif eta_s >= 60:
+            m = int(eta_s // 60)
+            s = int(eta_s % 60)
+            return f'{m}분 {s}초'
+        else:
+            return f'{int(eta_s)}초'
+
+    def _set_total_eta(self, eta_s):
+        """''전체' 행에 표시되는 전체 다운로드 완료 예상 시간 업데이트."""
+        def _u():
+            if eta_s > 0:
+                self.total_eta_label.configure(text=f'⏱ 전체 {self._fmt_eta(eta_s)} 남음')
+            else:
+                self.total_eta_label.configure(text='')
+        self.after(0, _u)
+
+    def _set_img_progress(self, downloaded, total_b, speed_bps):
+        """1개 이미지 내부 진행 업데이트 (bytes, bytes, bytes/s)."""
+        def _u():
+            if downloaded == 0 and total_b == 0:
+                self.sub_prog_var.set(0)
+                self.sub_prog_label.configure(text='')
+                self.speed_label.configure(text='')
+                self.eta_label.configure(text='')
+                return
+
+            if total_b > 0:
+                self.sub_prog_var.set(min(downloaded / total_b * 100, 100))
+                self.sub_prog_label.configure(
+                    text=f'{downloaded // 1024:,} / {total_b // 1024:,} KB')
+            else:
+                self.sub_prog_var.set(0)
+                self.sub_prog_label.configure(text=f'{downloaded // 1024:,} KB')
+
+            # 속도
+            if speed_bps >= 1_048_576:
+                spd_txt = f'{speed_bps / 1_048_576:.1f} MB/s'
+            elif speed_bps >= 1024:
+                spd_txt = f'{speed_bps / 1024:.0f} KB/s'
+            else:
+                spd_txt = f'{int(speed_bps)} B/s'
+            self.speed_label.configure(text=f'⚡️ {spd_txt}')
+
+            # 이미지 1개 ETA
+            if speed_bps > 0 and total_b > 0:
+                self.eta_label.configure(
+                    text=f'⏱ {self._fmt_eta((total_b - downloaded) / speed_bps)} 남음')
+            else:
+                self.eta_label.configure(text='')
         self.after(0, _u)
 
     def _set_dl(self, on):
@@ -751,9 +1054,37 @@ class App(tk.Tk):
         if on:
             self.dl_btn.configure(text='⏳  다운로드 중...', state='disabled',
                                   bg='#2e3350', cursor='watch')
+            self.pause_btn.configure(state='normal', text='⏸  일시정지')
+            self.stop_btn.configure(state='normal')
         else:
             self.dl_btn.configure(text='⬇   다운로드 시작', state='normal',
                                   bg=self.ACCENT, cursor='hand2')
+            self.pause_btn.configure(state='disabled', text='⏸  일시정지')
+            self.stop_btn.configure(state='disabled')
+            # 서브 프로그레스 정리
+            self.sub_prog_var.set(0)
+            self.sub_prog_label.configure(text='')
+            self.speed_label.configure(text='')
+            self.eta_label.configure(text='')
+
+    def _toggle_pause(self):
+        if self._pause_event.is_set():
+            # 일시정지 해제 → 재개
+            self._pause_event.clear()
+            self.pause_btn.configure(text='⏸  일시정지', bg=self.WARN, fg='#1a1d2a')
+            self._log('[*] 다운로드 재개')
+        else:
+            # 일시정지
+            self._pause_event.set()
+            self.pause_btn.configure(text='▶  재개', bg=self.SUCCESS, fg='#1a1d2a')
+            self._log('[*] 다운로드 일시정지')
+
+    def _stop_download(self):
+        if messagebox.askyesno('중지 확인', '다운로드를 중지하시겠습니까?\n(진행 중인 이미지는 차단됩니다)'):
+            self._pause_event.clear()  # 일시정지 상태면 해제 후 중지
+            self._stop_event.set()
+            self._log('[*] 중지 요청 전송...')
+
 
     # ── 다운로드 ─────────────────────────────────────────────────────────────
 
@@ -763,6 +1094,7 @@ class App(tk.Tk):
         urls       = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
         out        = self.dir_var.get().strip()
         cookie_str = self.cookie_var.get().strip()
+        download_original = self.orig_img_var.get()
 
         if not urls:
             messagebox.showwarning('입력 필요','URL을 하나 이상 입력해주세요.'); return
@@ -773,10 +1105,14 @@ class App(tk.Tk):
             messagebox.showwarning('입력 필요','저장 위치를 선택해주세요.'); return
 
         self._clear_log()
-        self._set_progress(0,0)
+        self._set_progress(0, 0)
         self.prog_label.configure(text='')
         if cookie_str:
             self._log(f'[*] 쿠키 인증 활성화 ({len(cookie_str)}자)')
+
+        # 이벤트 초기화
+        self._stop_event.clear()
+        self._pause_event.clear()
         self._set_dl(True)
 
         total_n  = len(urls)
@@ -807,9 +1143,22 @@ class App(tk.Tk):
 
         def _run():
             for url in urls:
+                if self._stop_event.is_set():
+                    break
                 self._log(f'\n── {url}')
-                download_article(url, out, self._log, self._set_progress,
-                                 _done, _err, cookie_str=cookie_str)
+                download_article(
+                    url, out, self._log, self._set_progress,
+                    _done, _err,
+                    cookie_str=cookie_str,
+                    download_original=download_original,
+                    set_img_progress=self._set_img_progress,
+                    set_total_eta=self._set_total_eta,
+                    stop_event=self._stop_event,
+                    pause_event=self._pause_event,
+                )
+            # 루프 종료 후 완료 처리 (stop으로 조기 종료 시)
+            if self._stop_event.is_set() and done_n[0] < total_n:
+                self.after(0, lambda: self._set_dl(False))
 
         threading.Thread(target=_run, daemon=True).start()
 
