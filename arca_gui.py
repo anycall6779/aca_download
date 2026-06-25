@@ -1,15 +1,14 @@
 """
 arca_gui.py — 아카라이브 게시글 ZIP 저장기 (GUI, 다중 URL)
 """
-
-import io, re, copy, zipfile, threading, base64, os, time
+import io, re, copy, zipfile, threading, base64, os, time, json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+import requests # type: ignore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
@@ -33,7 +32,25 @@ DEFAULT_HEADERS = {
 MAX_WORKERS   = 3   # 미리보기 화질: 이미지 병렬 수
 FETCH_RETRY   = 10  # ArcaRefresher fetchWithRetry tryCount
 FETCH_WAIT    = 1.0 # ArcaRefresher fetchWithRetry interval (1초)
-ICON_PATH     = Path(__file__).parent / 'arca_icon.png'
+CONFIG_PATH   = Path(__file__).parent / 'config.json'
+ICON_PATH     = Path(__file__).parent / 'Icon.png'
+
+# ── UI 상수 ───────────────────────────────────────────────────────────────────
+
+BG      = '#13151f'
+PANEL   = '#1c1f2e' # 카드보다 어두운 패널
+CARD    = '#252839'
+INPUT   = '#1a1d2a'
+ACCENT  = '#5c7cfa'
+TEXT    = '#ffffff'
+MUTED   = '#a0a8c8'
+SUCCESS = '#2cdb8f'
+WARN    = '#fcbc30'
+ERROR   = '#fa5252' # 기존 DEL_C와 동일
+BORDER  = '#2e3350' # 카드 테두리
+SEP     = '#23263a'
+FONT_MAIN = '맑은 고딕'
+FONT_CODE = '맑은 고딕'
 
 # ── 다운로드 로직 ─────────────────────────────────────────────────────────────
 
@@ -56,9 +73,13 @@ def _make_session(base_url, cookie_str=''):
     s.mount('http://', adp); s.mount('https://', adp)
     return s
 
-def sanitize_filename(name, max_len=80):
-    name = re.sub(r'[\\/:*?"<>|]+',' ',name).strip()
-    return re.sub(r'\s+','-',name)[:max_len] or 'post'
+def sanitize_filename(name: str, max_len: int = 80) -> str:
+    """파일 이름으로 사용할 수 없는 문자를 공백으로 바꾸고 길이를 제한합니다."""
+    # 파일 시스템에서 허용되지 않는 문자 제거: \ / : * ? " < > |
+    # 이모지를 포함한 다른 유니코드 문자는 유지합니다.
+    name = re.sub(r'[\\/:*?"<>|]', ' ', name)
+    name = name.strip()
+    return name[:max_len] or 'post'
 
 def get_image_ext(src):
     try:
@@ -69,6 +90,37 @@ def get_image_ext(src):
 
 def escape_html(s):
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+
+def _get_article_info(url, cookie_str, log_func, on_error_func):
+    """주어진 URL에서 게시글 제목과 BeautifulSoup 객체를 추출합니다. 세션도 함께 반환합니다."""
+    try:
+        session = _make_session(url, cookie_str=cookie_str)
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 451:
+            on_error_func(f'HTTP 451: 법적 사유로 차단된 페이지입니다.\n'
+                          f'유효한 아카라이브 로그인 쿠키를 입력해야 접근할 수 있습니다. (URL: {url})')
+            return None, None, None # Indicate failure
+        resp.raise_for_status()
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'lxml')
+
+        # <div class="title-row"> <div class="title"> 에서 제목 추출
+        title_div = soup.select_one('div.title-row > div.title')
+        if title_div:
+            for span_tag in title_div.find_all('span'):
+                span_tag.decompose()
+            T = title_div.get_text(strip=True)
+        else:
+            og = soup.find('meta', property='og:title')
+            T  = (og.get('content','') if og else '') or (soup.title.string if soup.title else '') or 'post'
+            if ' - 아카라이브' in T:
+                T = T.split(' - 아카라이브')[0].rsplit(' - ', 1)[0]
+            T = T.strip()
+        return (T if T else 'unknown_article'), soup, session
+    except Exception as e:
+        log_func(f'[WARN] URL {url} 에서 정보 추출 실패: {e}')
+        on_error_func(f'게시글 정보 추출 중 오류 발생 (URL: {url}): {e}')
+        return None, None, None # Indicate failure
 
 # ── ArcaRefresher ImageDownloader 이식 ────────────────────────────────────────────
 #
@@ -162,26 +214,19 @@ def fetch_image(session, src, log, chunk_cb=None, stop_event=None, pause_event=N
 
 
 def download_article(url, output_dir, log, set_progress, on_done, on_error,
+                     session, pre_fetched_title, pre_fetched_soup,
                      cookie_str='', download_original=True,
-                     set_img_progress=None, set_total_eta=None,
+                     add_id_to_filename=False, set_img_progress=None, set_total_eta=None,
                      stop_event=None, pause_event=None):
     try:
-        session = _make_session(url, cookie_str=cookie_str)
         log(f'[*] 요청: {url}')
         if cookie_str.strip():
             log('    (쿠키 인증 사용 중)')
-        resp = session.get(url, timeout=10)
-        if resp.status_code == 451:
-            on_error(f'HTTP 451: 법적 사유로 차단된 페이지입니다.\n'
-                     f'유효한 아카라이브 로그인 쿠키를 입력해야 접근할 수 있습니다.')
-            return
-        resp.raise_for_status()
-        resp.encoding = 'utf-8'
-        soup = BeautifulSoup(resp.text, 'lxml')
 
-        og = soup.find('meta', property='og:title')
-        T  = (og.get('content','') if og else '') or (soup.title.string if soup.title else '') or 'post'
-        T  = T.strip()
+        T = pre_fetched_title
+        soup = pre_fetched_soup
+        if not T or not soup:
+            on_error("미리 가져온 제목 또는 soup 객체가 없습니다."); return
 
         ae = (soup.find(rel='author') or
               soup.select_one('.article-header .user,.user-info .nick,.writer,.author'))
@@ -242,6 +287,10 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
             # 원본 화질: 순차 다운로드 (429 방지)
             global_start     = time.time()        # 전체 다운 시작
             completed_sizes  = []                  # 완료된 이미지 바이트 크기
+            
+            # 부드러운 속도 표시를 위한 변수
+            self._last_speed_update_time = 0
+            self._last_speed_update_bytes = 0
 
             for task in tasks:
                 if stop_event and stop_event.is_set():
@@ -257,10 +306,17 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
                               _img_start=img_start_time, _speed=speed_bps,
                               _idx=idx):
                     elapsed_img = time.time() - _img_start
-                    if elapsed_img > 0:
-                        _speed[0] = dl_bytes / elapsed_img
-                    # 이미지 1개 ETA
-                    if set_img_progress:
+                    
+                    # 0.5초마다 속도 갱신하여 부드럽게 표시
+                    now = time.time()
+                    if now - self._last_speed_update_time > 0.5:
+                        if self._last_speed_update_time > 0:
+                            time_delta = now - self._last_speed_update_time
+                            byte_delta = dl_bytes - self._last_speed_update_bytes
+                            _speed[0] = byte_delta / time_delta if time_delta > 0 else 0
+                        
+                        self._last_speed_update_time = now
+                        self._last_speed_update_bytes = dl_bytes
                         set_img_progress(dl_bytes, total_b, _speed[0])
                     # 전체 ETA — 완료 이미지 평균 크기 기반
                     if set_total_eta and total_b > 0:
@@ -291,6 +347,10 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
                 set_progress(done_n, total)
                 if set_img_progress:
                     set_img_progress(0, 0, 0)  # 다음 이미지 전 리셋
+                
+                # 다음 이미지를 위해 속도 업데이트 변수 초기화
+                self._last_speed_update_time = 0
+                self._last_speed_update_bytes = 0
 
 
         else:
@@ -350,7 +410,12 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
             zf.writestr('meta.txt', '\n'.join([f'Title: {T}',f'Author: {A or "Unknown"}',
                                                f'Date: {D or "Unknown"}',f'Source: {U}',img_line]).encode('utf-8'))
 
-        out_path = Path(output_dir) / f'arca-{sanitize_filename(T)}.zip'
+        filename = sanitize_filename(T)
+        if add_id_to_filename:
+            article_id = url.split('/')[-1].split('?')[0].split('#')[0]
+            if article_id.isdigit():
+                filename += f' [{article_id}]'
+        out_path = Path(output_dir) / f'{filename}.zip'
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(zip_buf.getvalue())
         on_done(str(out_path.resolve()), len(downloaded), total)
@@ -362,30 +427,20 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
-    # 팔레트 (밝고 깔끔한 다크 테마)
-    BG      = '#13151f'
-    PANEL   = '#1c1f2e'
-    CARD    = '#252839'
-    INPUT   = '#1a1d2a'
-    ACCENT  = '#5c7cfa'
-    ACCENT2 = '#748ffc'
-    TEXT    = '#e9ecf5'
-    MUTED   = '#8890b0'
-    SUCCESS = '#51cf66'
-    WARN    = '#fcc419'
-    ERROR   = '#ff6b6b'
-    BORDER  = '#2e3350'
-    ADD_C   = '#20c997'
-    DEL_C   = '#fa5252'
-    SEP     = '#23263a'
-
     def __init__(self):
         super().__init__()
         self.title('아카라이브 다운로더')
-        self.geometry('780x850')
-        self.minsize(640, 600)
-        self.configure(bg=self.BG)
+        self.geometry('640x860')
+        self.minsize(640, 860)
+        self.configure(bg=BG)
         self.resizable(True, True)
+
+        # Windows 고해상도(HiDPI) 지원
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass # Windows 아닌 경우 등
 
         # 아카라이브 아이콘 설정
         if ICON_PATH.exists():
@@ -397,39 +452,39 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        self._url_rows: list[tuple] = []
-        self._url_container = None
         self._downloading   = False
         self._stop_event    = threading.Event()   # 중지
-        self._pause_event   = threading.Event()   # 수동: set=일시정지, clear=재개
+        self._pause_event   = threading.Event()   # 수동: set=일시정지, clear=계속다운
 
         self._build_styles()
         self._build_ui()
+        self._load_config() # 설정 로드 추가
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     # ── 스타일 ───────────────────────────────────────────────────────────────
 
     def _build_styles(self):
         s = ttk.Style(self)
         s.theme_use('clam')
-        s.configure('TFrame',       background=self.BG)
-        s.configure('Panel.TFrame', background=self.PANEL)
-        s.configure('TLabel',       background=self.BG,    foreground=self.TEXT,  font=('Segoe UI',10))
-        s.configure('H1.TLabel',    background=self.BG,    foreground=self.TEXT,  font=('Segoe UI',17,'bold'))
-        s.configure('Muted.TLabel', background=self.BG,    foreground=self.MUTED, font=('Segoe UI',9))
-        s.configure('TProgressbar',     troughcolor=self.PANEL, background=self.ACCENT,  thickness=4,  borderwidth=0)
-        s.configure('Sub.TProgressbar', troughcolor=self.PANEL, background=self.SUCCESS, thickness=6,  borderwidth=0)
+        s.configure('TFrame',       background=BG)
+        s.configure('Panel.TFrame', background=PANEL) # type: ignore
+        s.configure('TLabel',       background=BG,    foreground=TEXT,  font=(FONT_MAIN,10))
+        s.configure('H1.TLabel',    background=BG,    foreground=TEXT,  font=(FONT_MAIN,17,'bold'))
+        s.configure('Muted.TLabel', background=BG,    foreground=MUTED, font=(FONT_MAIN,9))
+        s.configure('TProgressbar',     troughcolor=PANEL, background=ACCENT,  thickness=4,  borderwidth=0)
+        s.configure('Sub.TProgressbar', troughcolor=PANEL, background=SUCCESS, thickness=6,  borderwidth=0)
         # 레이아웃을 TProgressbar에서 복사 (없으면 'Horizontal.Sub.TProgressbar not found' 오류)
         s.layout('Sub.TProgressbar', s.layout('Horizontal.TProgressbar'))
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        outer = tk.Frame(self, bg=self.BG)
+        outer = tk.Frame(self, bg=BG)
         outer.pack(fill='both', expand=True, padx=28, pady=24)
 
         # ── 헤더 ─────────────────────────────────────────────────────────
-        hdr = tk.Frame(outer, bg=self.BG)
-        hdr.pack(fill='x', pady=(0,20))
+        hdr = tk.Frame(outer, bg=BG)
+        hdr.pack(fill='x', pady=(0,16)) # 여백 감소
 
         # 아이콘 + 제목
         if ICON_PATH.exists():
@@ -437,302 +492,346 @@ class App(tk.Tk):
                 from PIL import Image, ImageTk
                 ico = Image.open(ICON_PATH).resize((36,36), Image.LANCZOS)
                 self._hdr_icon = ImageTk.PhotoImage(ico)
-                tk.Label(hdr, image=self._hdr_icon, bg=self.BG).pack(side='left', padx=(0,10))
+                tk.Label(hdr, image=self._hdr_icon, bg=BG).pack(side='left', padx=(0,10))
             except: pass
 
-        title_col = tk.Frame(hdr, bg=self.BG)
+        title_col = tk.Frame(hdr, bg=BG)
         title_col.pack(side='left')
         tk.Label(title_col, text='아카라이브 다운로더',
-                 bg=self.BG, fg=self.TEXT, font=('Segoe UI',17,'bold')).pack(anchor='w')
+                 bg=BG, fg=TEXT, font=(FONT_MAIN,17,'bold')).pack(anchor='w')
         tk.Label(title_col, text='게시글 URL을 입력하면 이미지 포함 ZIP으로 저장합니다',
-                 bg=self.BG, fg=self.MUTED, font=('Segoe UI',9)).pack(anchor='w')
+                 bg=BG, fg=MUTED, font=(FONT_MAIN,9)).pack(anchor='w')
+
+        # --- 로그인 위젯 컨테이너 (헤더 오른쪽에 배치) ---
+        login_frame = tk.Frame(hdr, bg=BG)
+        login_frame.pack(side='right', anchor='n', pady=0)
+
+        # 상태 표시 라벨 (상단)
+        self.login_status_var = tk.StringVar(value='미로그인')
+        self.login_status_lbl = tk.Label(
+            login_frame, textvariable=self.login_status_var,
+            bg=BG, fg=MUTED,
+            font=(FONT_MAIN, 9), anchor='e'
+        )
+        self.login_status_lbl.pack(anchor='e', pady=(0, 2))
+
+        # 로그인/로그아웃 버튼 (하단)
+        self.login_btn = tk.Button(
+            login_frame, text='아카라이브 로그인',
+            command=self._do_login,
+            bg=ACCENT, fg=TEXT,
+            activebackground=ACCENT, activeforeground=TEXT,
+            font=(FONT_MAIN, 9, 'bold'),
+            relief='flat', cursor='hand2', padx=12, pady=6, bd=0
+        )
+        self.login_btn.pack(fill='x')
+        # ------------------------------------------------
 
         # ── URL 섹션 ──────────────────────────────────────────────────────
         self._section_label(outer, 'URL 목록')
 
-        url_card = tk.Frame(outer, bg=self.CARD,
-                            highlightbackground=self.BORDER, highlightthickness=1)
-        url_card.pack(fill='x', pady=(4,16))
+        url_card = tk.Frame(outer, bg=CARD,
+                            highlightbackground=BORDER, highlightthickness=1)
+        url_card.pack(fill='x', pady=(4,12))
 
-        top_row = tk.Frame(url_card, bg=self.CARD)
-        top_row.pack(fill='x', padx=14, pady=(12,6))
-        tk.Label(top_row, text='다운로드할 게시글 URL을 입력하세요',
-                 bg=self.CARD, fg=self.MUTED, font=('Segoe UI',9)).pack(side='left')
-        self._btn(top_row, '＋  URL 추가', self._add_url_row,
-                  bg=self.ADD_C, side='right')
+        url_top_row = tk.Frame(url_card, bg=CARD)
+        url_top_row.pack(fill='x', padx=14, pady=(12,6))
 
-        # URL 행 컨테이너
-        self._url_container = tk.Frame(url_card, bg=self.CARD)
-        self._url_container.pack(fill='x', padx=14, pady=(0,12))
-        self._add_url_row()   # 첫 행
+        tk.Label(url_top_row, text='다운로드 할 게시글 URL을(다수의 URL은 , 로 구분) 입력하세요.',
+                 bg=CARD, fg=MUTED, font=(FONT_MAIN,9)).pack(side='left')
 
-        # ── 엄카라이브 로그인 섹션 ──────────────────────────────────
-        self._section_label(outer, '아카라이브 로그인 (선택 — HTTP 451 차단 우회)')
+        self._btn(url_top_row, '파일에서 불러오기', self._load_urls_from_file,
+                  bg=PANEL, fg=MUTED, side='right', padx=10, font_size=8)
 
-        cookie_card = tk.Frame(outer, bg=self.CARD,
-                               highlightbackground=self.BORDER, highlightthickness=1)
-        cookie_card.pack(fill='x', pady=(4,16))
-
-        ck_row = tk.Frame(cookie_card, bg=self.CARD)
-        ck_row.pack(fill='x', padx=14, pady=14)
-
-        # 상태 표시 라벨
-        self.login_status_var = tk.StringVar(value='⚪  미로그인')
-        self.login_status_lbl = tk.Label(
-            ck_row, textvariable=self.login_status_var,
-            bg=self.CARD, fg=self.MUTED,
-            font=('Segoe UI', 10, 'bold'), width=22, anchor='w'
-        )
-        self.login_status_lbl.pack(side='left')
-
-        # 로그인 버튼
-        self.login_btn = tk.Button(
-            ck_row, text='🔑  아카라이브 로그인',
-            command=self._do_login,
-            bg=self.ACCENT, fg='#ffffff',
-            activebackground=self.ACCENT2, activeforeground='#ffffff',
-            font=('Segoe UI', 10, 'bold'),
-            relief='flat', cursor='hand2', padx=14, pady=6, bd=0
-        )
-        self.login_btn.pack(side='left', padx=(0, 8))
-
-        # 상태 초기화 버튼
-        tk.Button(
-            ck_row, text='삭제',
-            command=self._clear_login,
-            bg=self.INPUT, fg=self.MUTED,
-            activebackground=self.BORDER, activeforeground=self.TEXT,
-            font=('Segoe UI', 9),
-            relief='flat', cursor='hand2', padx=10, pady=6, bd=0
-        ).pack(side='left')
+        self.url_text = tk.Text(url_card, height=4,
+                                bg=INPUT, fg=TEXT, insertbackground=TEXT, # type: ignore
+                                font=(FONT_MAIN, 10), relief='flat',
+                                highlightbackground=BORDER, highlightthickness=1,
+                                selectbackground=BORDER, wrap='word', padx=8, pady=6)
+        self.url_text.pack(fill='x', padx=14, pady=(0,12))
+        self.url_text.bind('<Return>', lambda e: self._start_download())
 
         self.cookie_var = tk.StringVar()  # 내부 쿠키 저장용 (UI에 직접 표시 안 함)
-
-        tk.Label(cookie_card,
-                 text='  ℹ️  로그인 버튼을 클릭하면 브라우저 창이 열립니다. 로그인 완료 시 쿠키를 자동으로 가져옵니다.',
-                 bg=self.CARD, fg=self.MUTED, font=('Segoe UI', 8),
-                 justify='left'
-                 ).pack(anchor='w', padx=14, pady=(0, 10))
 
         # ── 저장 위치 ─────────────────────────────────────────────────────
         self._section_label(outer, '저장 위치')
 
-        dir_card = tk.Frame(outer, bg=self.CARD,
-                            highlightbackground=self.BORDER, highlightthickness=1)
-        dir_card.pack(fill='x', pady=(4,16))
+        dir_card = tk.Frame(outer, bg=CARD,
+                            highlightbackground=BORDER, highlightthickness=1)
+        dir_card.pack(fill='x', pady=(4,12)) # 여백 감소
 
-        dir_row = tk.Frame(dir_card, bg=self.CARD)
+        dir_row = tk.Frame(dir_card, bg=CARD)
         dir_row.pack(fill='x', padx=14, pady=12)
 
         self.dir_var = tk.StringVar(value=str(Path.home()/'Downloads'))
         tk.Entry(dir_row, textvariable=self.dir_var,
-                 bg=self.INPUT, fg=self.TEXT, insertbackground=self.TEXT,
-                 font=('Segoe UI',10), relief='flat',
-                 highlightbackground=self.BORDER, highlightthickness=1
+                 bg=INPUT, fg=TEXT, insertbackground=TEXT,
+                 font=(FONT_MAIN,10), relief='flat',
+                 highlightbackground=BORDER, highlightthickness=1
                  ).pack(side='left', fill='x', expand=True, ipady=8, padx=(0,8))
-        self._btn(dir_row, '📂  폴더 선택', self._browse_dir,
-                  bg=self.ACCENT, side='left')
+        self._btn(dir_row, '폴더 선택', self._browse_dir,
+                  bg=ACCENT, side='left')
 
         # ── 다운로드 설정 ─────────────────────────────────────────────────
         self._section_label(outer, '다운로드 설정')
 
-        settings_card = tk.Frame(outer, bg=self.CARD,
-                                 highlightbackground=self.BORDER, highlightthickness=1)
-        settings_card.pack(fill='x', pady=(4,16))
+        settings_card = tk.Frame(outer, bg=CARD,
+                                 highlightbackground=BORDER, highlightthickness=1)
+        settings_card.pack(fill='x', pady=(4,12)) # 여백 감소
 
-        settings_row = tk.Frame(settings_card, bg=self.CARD)
+        settings_row = tk.Frame(settings_card, bg=CARD)
         settings_row.pack(fill='x', padx=14, pady=12)
 
         self.orig_img_var = tk.BooleanVar(value=True)
         self.orig_img_cb = tk.Checkbutton(
             settings_row,
-            text='🖼️  이미지 원본 다운로드 (체크 해제 시 미리보기 화질로 다운로드)',
+            text='이미지 원본 다운로드 (체크 해제 시 미리보기 화질로 다운로드)',
             variable=self.orig_img_var,
-            bg=self.CARD,
-            fg=self.TEXT,
-            selectcolor=self.INPUT,
-            activebackground=self.CARD,
-            activeforeground=self.TEXT,
-            font=('Segoe UI', 10),
+            bg=CARD,
+            fg=TEXT,
+            selectcolor=INPUT,
+            activebackground=CARD,
+            activeforeground=TEXT,
+            font=(FONT_MAIN, 10),
             relief='flat',
             bd=0,
             cursor='hand2'
         )
         self.orig_img_cb.pack(side='left')
 
+        settings_row2 = tk.Frame(settings_card, bg=CARD)
+        settings_row2.pack(fill='x', padx=14, pady=(0, 12))
+
+        self.add_id_var = tk.BooleanVar(value=False)
+        self.add_id_cb = tk.Checkbutton(
+            settings_row2,
+            text='파일 이름에 게시글 ID 추가 (예: 제목 [12345].zip)',
+            variable=self.add_id_var,
+            bg=CARD,
+            fg=TEXT,
+            selectcolor=INPUT,
+            activebackground=CARD,
+            activeforeground=TEXT,
+            font=(FONT_MAIN, 10),
+            relief='flat', bd=0, cursor='hand2'
+        )
+        self.add_id_cb.pack(side='left')
+        settings_row3 = tk.Frame(settings_card, bg=CARD)
+        settings_row3.pack(fill='x', padx=14, pady=(0, 12))
+
+        self.notify_var = tk.BooleanVar(value=True)
+        self.notify_cb = tk.Checkbutton(
+            settings_row3,
+            text='다운로드 완료 시 알림',
+            variable=self.notify_var,
+            bg=CARD,
+            fg=TEXT,
+            selectcolor=INPUT,
+            activebackground=CARD,
+            activeforeground=TEXT,
+            font=(FONT_MAIN, 10),
+            relief='flat', bd=0, cursor='hand2'
+        )
+        self.notify_cb.pack(side='left')
+
         # ── 다운로드 제어 행 (시작 + 일시정지 + 중지) ──────────────────────
-        ctrl_bar = tk.Frame(outer, bg=self.BG)
+        ctrl_bar = tk.Frame(outer, bg=BG)
         ctrl_bar.pack(fill='x', pady=(0, 10))
 
+        # 8:1:1 비율을 위해 grid 레이아웃 사용
+        ctrl_bar.grid_columnconfigure(0, weight=8)
+        ctrl_bar.grid_columnconfigure(1, weight=1)
+        ctrl_bar.grid_columnconfigure(2, weight=1)
+
         self.dl_btn = tk.Button(
-            ctrl_bar, text='⬇   다운로드 시작',
+            ctrl_bar, text='다운로드 시작',
             command=self._start_download,
-            bg=self.ACCENT, fg='#ffffff',
-            activebackground=self.ACCENT2, activeforeground='#ffffff',
-            font=('Segoe UI', 11, 'bold'),
-            relief='flat', cursor='hand2', pady=10, padx=16, bd=0
+            bg=ACCENT, fg=TEXT,
+            activebackground=ACCENT, activeforeground=TEXT,
+            font=(FONT_MAIN, 9, 'bold'),
+            relief='flat', cursor='hand2', pady=8, bd=0
         )
-        self.dl_btn.pack(side='left', fill='x', expand=True, padx=(0, 8))
+        self.dl_btn.grid(row=0, column=0, sticky='ew', padx=(0, 4))
 
         self.pause_btn = tk.Button(
-            ctrl_bar, text='⏸  일시정지',
+            ctrl_bar, text='일시정지',
             command=self._toggle_pause,
-            bg=self.WARN, fg='#1a1d2a',
-            activebackground='#e6b800', activeforeground='#1a1d2a',
-            font=('Segoe UI', 9, 'bold'),
-            relief='flat', cursor='hand2', padx=10, pady=16, bd=0, state='disabled'
+            bg=WARN, fg=INPUT,
+            disabledforeground=BORDER,
+            activebackground=WARN, activeforeground=INPUT,
+            font=(FONT_MAIN, 9, 'bold'),
+            relief='flat', cursor='hand2', pady=8, bd=0, state='disabled'
         )
-        self.pause_btn.pack(side='left', padx=(0, 6))
+        self.pause_btn.grid(row=0, column=1, sticky='ew', padx=(4, 4))
 
         self.stop_btn = tk.Button(
-            ctrl_bar, text='⏹  중지',
+            ctrl_bar, text='작업중지',
             command=self._stop_download,
-            bg=self.DEL_C, fg='#ffffff',
-            activebackground='#d9364a', activeforeground='#ffffff',
-            font=('Segoe UI', 9, 'bold'),
-            relief='flat', cursor='hand2', padx=10, pady=16, bd=0, state='disabled'
+            bg=ERROR, fg=TEXT,
+            disabledforeground=BORDER,
+            activebackground=ERROR, activeforeground=TEXT,
+            font=(FONT_MAIN, 9, 'bold'),
+            relief='flat', cursor='hand2', pady=8, bd=0, state='disabled'
         )
-        self.stop_btn.pack(side='left')
+        self.stop_btn.grid(row=0, column=2, sticky='ew', padx=(4, 0))
 
         # ── 진행 파널 (2줄 콤팩트) ──────────────────────────────────
-        prog_card = tk.Frame(outer, bg=self.CARD,
-                             highlightbackground=self.BORDER, highlightthickness=1)
+        prog_card = tk.Frame(outer, bg=CARD,
+                             highlightbackground=BORDER, highlightthickness=1)
         prog_card.pack(fill='x', pady=(0, 8))
 
         # 전체 현황 행
-        row_total = tk.Frame(prog_card, bg=self.CARD)
+        row_total = tk.Frame(prog_card, bg=CARD)
         row_total.pack(fill='x', padx=14, pady=(8, 3))
-        tk.Label(row_total, text='전체', bg=self.CARD, fg=self.MUTED,
-                 font=('Segoe UI', 8, 'bold'), width=4, anchor='w').pack(side='left')
+        tk.Label(row_total, text='전체', bg=CARD, fg=MUTED,
+                 font=(FONT_MAIN, 8, 'bold'), width=4, anchor='w').pack(side='left')
         self.prog_var = tk.DoubleVar(value=0)
         ttk.Progressbar(row_total, variable=self.prog_var,
                         maximum=100, style='TProgressbar').pack(side='left', fill='x', expand=True, padx=(6, 8))
-        self.total_eta_label = tk.Label(row_total, text='', bg=self.CARD, fg=self.MUTED,
-                                        font=('Segoe UI', 8))
+        self.total_eta_label = tk.Label(row_total, text='', bg=CARD, fg=MUTED,
+                                        font=(FONT_MAIN, 8))
         self.total_eta_label.pack(side='right')
-        self.prog_label = tk.Label(row_total, text='', bg=self.CARD, fg=self.MUTED,
-                                   font=('Segoe UI', 8), width=14, anchor='e')
+        self.prog_label = tk.Label(row_total, text='', bg=CARD, fg=MUTED,
+                                   font=(FONT_MAIN, 8), width=14, anchor='e')
         self.prog_label.pack(side='right', padx=(0, 6))
 
         # 현재 이미지 행 (프로그레스 + KB 표시 + 속도 + ETA 한 행)
-        row_img = tk.Frame(prog_card, bg=self.CARD)
+        row_img = tk.Frame(prog_card, bg=CARD)
         row_img.pack(fill='x', padx=14, pady=(0, 8))
-        tk.Label(row_img, text='이미지', bg=self.CARD, fg=self.MUTED,
-                 font=('Segoe UI', 8, 'bold'), width=4, anchor='w').pack(side='left')
+        tk.Label(row_img, text='이미지', bg=CARD, fg=MUTED,
+                 font=(FONT_MAIN, 8, 'bold'), width=4, anchor='w').pack(side='left')
         self.sub_prog_var = tk.DoubleVar(value=0)
         ttk.Progressbar(row_img, variable=self.sub_prog_var,
                         maximum=100, style='Sub.TProgressbar').pack(side='left', fill='x', expand=True, padx=(6, 8))
-        self.eta_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
-                                  font=('Segoe UI', 8))
+        self.eta_label = tk.Label(row_img, text='', bg=CARD, fg=MUTED,
+                                  font=(FONT_MAIN, 8))
         self.eta_label.pack(side='right')
-        self.speed_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
-                                    font=('Segoe UI', 8))
+        self.speed_label = tk.Label(row_img, text='', bg=CARD, fg=MUTED,
+                                    font=(FONT_MAIN, 8))
         self.speed_label.pack(side='right', padx=(0, 6))
-        self.sub_prog_label = tk.Label(row_img, text='', bg=self.CARD, fg=self.MUTED,
-                                       font=('Segoe UI', 8), width=16, anchor='e')
+        self.sub_prog_label = tk.Label(row_img, text='', bg=CARD, fg=MUTED,
+                                       font=(FONT_MAIN, 8), width=16, anchor='e')
         self.sub_prog_label.pack(side='right', padx=(0, 4))
 
 
 
         # ── 로그 ─────────────────────────────────────────────────────────
-        log_top = tk.Frame(outer, bg=self.BG)
+        log_top = tk.Frame(outer, bg=BG)
         log_top.pack(fill='x')
-        tk.Label(log_top, text='실행 로그', bg=self.BG, fg=self.MUTED,
-                 font=('Segoe UI',9,'bold')).pack(side='left')
+        tk.Label(log_top, text='실행 로그', bg=BG, fg=MUTED,
+                 font=(FONT_MAIN,9,'bold')).pack(side='left')
         self._btn(log_top, '지우기', self._clear_log,
-                  bg=self.PANEL, fg=self.MUTED, side='right', padx=8, font_size=8)
+                  bg=PANEL, fg=MUTED, side='right', padx=8, font_size=8)
 
-        log_wrap = tk.Frame(outer, bg=self.INPUT,
-                            highlightbackground=self.BORDER, highlightthickness=1)
+        log_wrap = tk.Frame(outer, bg=INPUT,
+                            highlightbackground=BORDER, highlightthickness=1)
         log_wrap.pack(fill='both', expand=True, pady=(4,0))
-        self.log_text = tk.Text(log_wrap, bg=self.INPUT, fg=self.TEXT,
-                                font=('Consolas',9), relief='flat',
+        self.log_text = tk.Text(log_wrap, bg=INPUT, fg=TEXT,
+                                font=(FONT_CODE,9), relief='flat',
                                 wrap='word', state='disabled',
-                                selectbackground=self.BORDER,
-                                insertbackground=self.TEXT, padx=12, pady=10)
+                                selectbackground=BORDER,
+                                insertbackground=TEXT, padx=12, pady=10)
         self.log_text.pack(side='left', fill='both', expand=True)
         sb = ttk.Scrollbar(log_wrap, command=self.log_text.yview)
         sb.pack(side='right', fill='y')
         self.log_text['yscrollcommand'] = sb.set
 
-        self.log_text.tag_configure('info',    foreground=self.TEXT)
-        self.log_text.tag_configure('warn',    foreground=self.WARN)
-        self.log_text.tag_configure('success', foreground=self.SUCCESS)
-        self.log_text.tag_configure('error',   foreground=self.ERROR)
-        self.log_text.tag_configure('sub',     foreground=self.MUTED)
+        self.log_text.tag_configure('info',    foreground=TEXT)
+        self.log_text.tag_configure('warn',    foreground=WARN)
+        self.log_text.tag_configure('success', foreground=SUCCESS)
+        self.log_text.tag_configure('error',   foreground=ERROR)
+        self.log_text.tag_configure('sub',     foreground=MUTED)
 
     # ── 헬퍼 ─────────────────────────────────────────────────────────────────
 
-    def _section_label(self, parent, text):
-        f = tk.Frame(parent, bg=self.BG)
-        f.pack(fill='x', pady=(0,2))
-        tk.Label(f, text=text, bg=self.BG, fg=self.MUTED,
-                 font=('Segoe UI',9,'bold')).pack(side='left')
-        tk.Frame(f, bg=self.SEP, height=1).pack(side='left', fill='x', expand=True, padx=(8,0), pady=6)
+    def _load_config(self):
+        """config.json 파일에서 저장된 설정을 로드합니다."""
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                config = json.load(f)
 
-    def _btn(self, parent, text, cmd, bg=None, fg='#ffffff',
-             side='left', padx=10, font_size=9):
-        bg = bg or self.ACCENT
-        tk.Button(parent, text=text, command=cmd,
-                  bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
-                  font=('Segoe UI', font_size, 'bold'),
+            cookie_str = config.get('cookie_str', '')
+            if cookie_str:
+                self.cookie_var.set(cookie_str)
+                self._set_login_status(f'로그인됨 (자동)', SUCCESS)
+                self._log('[*] 저장된 로그인 정보로 자동 로그인했습니다.')
+
+            saved_dir = config.get('download_dir', '')
+            if saved_dir and os.path.isdir(saved_dir):
+                self.dir_var.set(saved_dir)
+                self._log(f'[*] 저장된 경로를 불러왔습니다: {saved_dir}')
+            
+            self.orig_img_var.set(config.get('download_original', True))
+            self.add_id_var.set(config.get('add_id_to_filename', False))
+            self.notify_var.set(config.get('notify_on_complete', True))
+
+        except Exception as e:
+            self._log(f'[✗] 설정 파일 로드 실패: {e}')
+
+    def _save_config(self):
+        """현재 설정을 config.json 파일에 저장합니다."""
+        try:
+            config = {
+                'cookie_str': self.cookie_var.get(),
+                'download_dir': self.dir_var.get(),
+                'download_original': self.orig_img_var.get(),
+                'add_id_to_filename': self.add_id_var.get(),
+                'notify_on_complete': self.notify_var.get(),
+            }
+            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            self._log(f'[✗] 설정 파일 저장 실패: {e}')
+
+    def _section_label(self, parent, text):
+        f = tk.Frame(parent, bg=BG)
+        f.pack(fill='x', pady=(0,2))
+        tk.Label(f, text=text, bg=BG, fg=MUTED,
+                 font=(FONT_MAIN,9,'bold')).pack(side='left') # bold 추가
+        tk.Frame(f, bg=SEP, height=1).pack(side='left', fill='x', expand=True, padx=(8,0), pady=6)
+
+    def _btn(self, parent, text, cmd, bg=None, fg=None,
+             side='left', padx=10, font_size=9, active_fg=None):
+        bg = bg or ACCENT
+        fg = fg or TEXT
+        tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                  activebackground=bg, activeforeground=(active_fg or fg),
+                  font=(FONT_MAIN, font_size, 'bold'),
                   relief='flat', cursor='hand2', padx=padx, pady=5, bd=0
                   ).pack(side=side)
-
-    # ── URL 행 ───────────────────────────────────────────────────────────────
-
-    def _add_url_row(self):
-        idx = len(self._url_rows)
-        row = tk.Frame(self._url_container, bg=self.CARD)
-        row.pack(fill='x', pady=(0,5))
-
-        var = tk.StringVar()
-        ent = tk.Entry(row, textvariable=var,
-                       bg=self.INPUT, fg=self.TEXT, insertbackground=self.TEXT,
-                       font=('Segoe UI',11), relief='flat',
-                       highlightbackground=self.BORDER, highlightthickness=1)
-        ent.pack(side='left', fill='x', expand=True, ipady=8, padx=(0,6))
-        ent.bind('<Return>', lambda e: self._start_download())
-
-        tk.Button(row, text='붙여넣기',
-                  command=lambda v=var: v.set(self._clip()),
-                  bg=self.INPUT, fg=self.MUTED, activebackground=self.BORDER,
-                  activeforeground=self.TEXT, font=('Segoe UI',9),
-                  relief='flat', cursor='hand2', padx=8, bd=0
-                  ).pack(side='left', padx=(0,4))
-
-        rec = (row, var, ent)
-        del_cfg = dict(bg=self.CARD, fg=self.DEL_C, activebackground=self.BORDER,
-                       activeforeground=self.DEL_C, font=('Segoe UI',11,'bold'),
-                       relief='flat', cursor='hand2', padx=6, bd=0)
-        if idx == 0:
-            del_cfg.update(fg=self.BORDER, cursor='arrow')
-            tk.Button(row, text='✕', state='disabled', **del_cfg).pack(side='left')
-        else:
-            tk.Button(row, text='✕',
-                      command=lambda r=row, rc=rec: self._remove_url_row(r, rc),
-                      **del_cfg).pack(side='left')
-
-        self._url_rows.append(rec)
-
-    def _remove_url_row(self, frame, rec):
-        if len(self._url_rows) <= 1: return
-        self._url_rows.remove(rec)
-        frame.destroy()
 
     def _clip(self):
         try: return self.clipboard_get().strip()
         except: return ''
 
     def _set_login_status(self, text, color):
-        def _u():
-            self.login_status_var.set(text)
-            self.login_status_lbl.configure(fg=color)
-        self.after(0, _u)
+        """로그인 상태 라벨과 버튼의 상태를 업데이트합니다."""
+        # self.after를 사용하지 않아도 메인 스레드에서 안전하게 호출됩니다.
+        self.login_status_var.set(text)
+        self.login_status_lbl.configure(fg=color)
+
+        # 로그인 상태에 따라 버튼 텍스트, 색상, 기능 변경
+        if '로그인됨' in text:
+            self.login_btn.config(
+                text='로그아웃',
+                command=self._clear_login,
+                bg=INPUT, fg=MUTED,
+                activebackground=BORDER
+            )
+        else:  # 미로그인 또는 오류 상태
+            self.login_btn.config(
+                text='아카라이브 로그인',
+                command=self._do_login,
+                bg=ACCENT, fg=TEXT,
+                activebackground=ACCENT, activeforeground=TEXT
+            )
 
     def _clear_login(self):
         self.cookie_var.set('')
-        self._set_login_status('⚪  미로그인', self.MUTED)
+        self._set_login_status('미로그인', MUTED)
+        self._save_config() # 쿠키 삭제 후 설정 저장
         self._log('[*] 로그인 정보 삭제됨')
 
     def _do_login(self):
@@ -742,7 +841,7 @@ class App(tk.Tk):
                 return
 
         self.login_btn.configure(state='disabled', text='브라우저 열는 중...')
-        self._set_login_status('⏳  로그인 대기 중', '#fbbf24')
+        self._set_login_status('로그인 대기 중', WARN)
         self._log('[*] 아카라이브 로그인 브라우저 열기 중...')
 
         def _run():
@@ -751,9 +850,9 @@ class App(tk.Tk):
             except RuntimeError as e:
                 _e = str(e)
                 self.after(0, lambda msg=_e: (
-                    self._set_login_status('❌  브라우저 오류', self.ERROR),
+                    self._set_login_status('브라우저 오류', ERROR),
                     self._log(f'[✗] {msg}'),
-                    self.login_btn.configure(state='normal', text='🔑  아카라이브 로그인')
+                    self.login_btn.configure(state='normal', text='아카라이브 로그인')
                 ))
                 return
 
@@ -778,17 +877,18 @@ class App(tk.Tk):
                         n = len(raw)
                         def _ok(cs=cookie_str, n=n):
                             self.cookie_var.set(cs)
-                            self._set_login_status(f'✅  로그인됨 ({n}개)', self.SUCCESS)
-                            self._log(f'[✓] 쿠키 {n}개 수집 완료 — 이제 다운로드하세요!')
-                            self.login_btn.configure(state='normal', text='🔑  다시 로그인')
+                            self._save_config() # 쿠키 저장 후 설정 저장
+                            self._set_login_status(f'로그인됨 ({n}개)', SUCCESS)
+                            self._log(f'[✓] 쿠키 {n}개 수집 완료! 이제 다운로드하세요.')
+                            self.login_btn.configure(state='normal', text='다시 로그인')
                         self.after(0, _ok)
                         time.sleep(2)
                         break
                 else:
-                    self.after(0, lambda: (
-                        self._set_login_status('⏰  시간 초과', self.ERROR),
-                        self._log('[⚠] 6분 내 로그인 감지 실패. 다시 시도해주세요.'),
-                        self.login_btn.configure(state='normal', text='🔑  아카라이브 로그인')
+                    self.after(0, lambda: ( # type: ignore
+                        self._set_login_status('시간 초과', ERROR),
+                        self._log('[!] 6분 내 로그인 감지 실패. 다시 시도해주세요.'),
+                        self.login_btn.configure(state='normal', text='아카라이브 로그인')
                     ))
             finally:
                 try: driver.quit()
@@ -869,7 +969,7 @@ class App(tk.Tk):
                 from webdriver_manager.microsoft import EdgeChromiumDriverManager
                 svc = ES(EdgeChromiumDriverManager().install())
                 driver = webdriver.Edge(service=svc, options=opts)
-            except Exception as e:
+            except (ImportError, Exception) as e: # webdriver_manager가 없거나 네트워크 오류
                 last_err = str(e)
 
         if driver is None:
@@ -910,84 +1010,116 @@ class App(tk.Tk):
 
         guide = tk.Toplevel(self)
         guide.title('Edge WebDriver 설치 안내')
-        guide.configure(bg=self.BG)
+        guide.configure(bg=BG)
         guide.resizable(False, False)
         guide.grab_set()
 
-        tk.Label(guide, text='⚙️  Edge WebDriver 설치가 필요합니다',
-                 bg=self.BG, fg=self.TEXT,
-                 font=('Segoe UI', 13, 'bold')).pack(pady=(24, 6), padx=24)
+        tk.Label(guide, text='Edge WebDriver 설치가 필요합니다',
+                 bg=BG, fg=TEXT,
+                 font=(FONT_MAIN, 13, 'bold')).pack(pady=(24, 6), padx=24)
 
         tk.Label(guide,
                  text=f'감지된 Edge 버전:  {edge_ver}',
-                 bg=self.BG, fg=self.MUTED,
-                 font=('Segoe UI', 10)).pack(pady=(0, 16), padx=24)
+                 bg=BG, fg=MUTED,
+                 font=(FONT_MAIN, 10)).pack(pady=(0, 16), padx=24)
 
         script_dir = str(Path(__file__).parent)
         steps = [
             ('1', '아래 버튼을 눌러 Microsoft Edge WebDriver 다운로드 페이지를 여세요.'),
             ('2', f'현재 Edge 버전({edge_ver})과 동일한 버전의 드라이버를 다운로드하세요.'),
             ('3', '다운받은 msedgedriver.exe를 아래 위치 중 한 곳에 저장하세요:'),
-            ('',  f'   ✅ 가장 쉬운 방법: {script_dir}\\  (프로그램과 같은 폴더)'),
-            ('',  '   • C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\'),
+            ('',  f'   ✅ 가장 쉬운 방법: {script_dir}\\  (프로그램과 같은 폴더)'), # type: ignore
+            ('',  '   • C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\'), # type: ignore
             ('',  '   • 또는 사용자 다운로드 폴더 (~/Downloads/)'),
             ('4', '저장 후 이 프로그램을 재실행하고 로그인 버튼을 다시 눌러주세요.'),
         ]
 
         for num, text in steps:
-            row = tk.Frame(guide, bg=self.BG)
+            row = tk.Frame(guide, bg=BG)
             row.pack(fill='x', padx=24, pady=2, anchor='w')
             if num:
-                tk.Label(row, text=f' {num} ', bg=self.ACCENT, fg='#fff',
-                         font=('Segoe UI', 9, 'bold'), width=2).pack(side='left', padx=(0, 8))
-            tk.Label(row, text=text, bg=self.BG, fg=self.TEXT,
-                     font=('Segoe UI', 9), justify='left', anchor='w').pack(side='left', fill='x')
+                tk.Label(row, text=f' {num} ', bg=ACCENT, fg=TEXT,
+                         font=(FONT_MAIN, 9, 'bold'), width=2).pack(side='left', padx=(0, 8))
+            tk.Label(row, text=text, bg=BG, fg=TEXT,
+                     font=(FONT_MAIN, 9), justify='left', anchor='w').pack(side='left', fill='x')
 
-        btn_row = tk.Frame(guide, bg=self.BG)
+        btn_row = tk.Frame(guide, bg=BG)
         btn_row.pack(pady=(20, 24), padx=24, fill='x')
 
-        tk.Button(btn_row, text='🌐  다운로드 페이지 열기',
+        tk.Button(btn_row, text='다운로드 페이지 열기',
                   command=lambda: webbrowser.open('https://developer.microsoft.com/ko-kr/microsoft-edge/tools/webdriver/'),
-                  bg=self.ACCENT, fg='#fff', activebackground=self.ACCENT2,
-                  font=('Segoe UI', 10, 'bold'),
+                  bg=ACCENT, fg=TEXT, activebackground=ACCENT, activeforeground=TEXT,
+                  font=(FONT_MAIN, 10, 'bold'),
                   relief='flat', cursor='hand2', padx=16, pady=8, bd=0
                   ).pack(side='left', padx=(0, 8))
 
         tk.Button(btn_row, text='닫기', command=guide.destroy,
-                  bg=self.INPUT, fg=self.MUTED,
-                  font=('Segoe UI', 10),
+                  bg=INPUT, fg=MUTED, activebackground=INPUT, activeforeground=MUTED,
+                  font=(FONT_MAIN, 10),
                   relief='flat', cursor='hand2', padx=16, pady=8, bd=0
                   ).pack(side='left')
 
     # ── 핸들러 ───────────────────────────────────────────────────────────────
 
+    def _load_urls_from_file(self):
+        """파일 대화상자를 열어 .txt 파일에서 URL을 읽어와 텍스트 영역에 추가합니다."""
+        filepath = filedialog.askopenfilename(
+            title="URL 목록 파일 선택",
+            filetypes=(("텍스트 파일", "*.txt"), ("모든 파일", "*.*")),
+            initialdir=str(Path(__file__).parent)
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 기존 내용이 있으면 줄바꿈으로 구분
+            current_content = self.url_text.get("1.0", "end-1c").strip()
+            self.url_text.insert("end", ('\n' if current_content else '') + content)
+            self._log(f"[*] 파일에서 URL을 불러왔습니다: {filepath}")
+        except Exception as e:
+            self._log(f"[✗] 파일 읽기 오류: {e}")
+            messagebox.showerror("파일 오류", f"파일을 읽는 중 오류가 발생했습니다:\n{e}")
+
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self.dir_var.get())
-        if d: self.dir_var.set(d)
+        if d:
+            self.dir_var.set(d)
+            self._save_config()
 
     def _clear_log(self):
         self.log_text.configure(state='normal')
         self.log_text.delete('1.0','end')
         self.log_text.configure(state='disabled')
 
+    def _get_log_tag(self, msg: str) -> str:
+        """로그 메시지 내용에 따라 적절한 태그를 반환합니다."""
+        if msg.startswith('[✗]') or 'error' in msg.lower():
+            return 'error'
+        if msg.startswith(('[✓]', '[*]')) or '완료' in msg:
+            return 'success'
+        if '[WARN]' in msg or '프록시' in msg or '건너뜀' in msg or '[!]' in msg:
+            return 'warn'
+        if msg.startswith(('    ', '  [')):
+            return 'sub'
+        return 'info'
+
     def _log(self, msg):
         def _w():
             self.log_text.configure(state='normal')
-            tag = ('warn'    if '[WARN]' in msg or '프록시' in msg or '건너뜀' in msg else
-                   'success' if msg.startswith('[✓]') or '완료' in msg else
-                   'error'   if msg.startswith('[✗]') or 'error' in msg.lower() else
-                   'sub'     if msg.startswith(('    ','  [')) else 'info')
-            self.log_text.insert('end', msg+'\n', tag)
+            self.log_text.insert('end', msg + '\n', self._get_log_tag(msg))
             self.log_text.see('end')
             self.log_text.configure(state='disabled')
         self.after(0, _w)
 
     def _set_progress(self, cur, tot):
         def _u():
-            self.prog_var.set((cur / tot * 100) if tot else 0)
-            self.prog_label.configure(text=f'{cur} / {tot} 이미지' if tot else '')
+            # self.prog_var.set((cur / tot * 100) if tot else 0)
+            # self.prog_label.configure(text=f'{cur} / {tot} 이미지' if tot else '')
             if not tot or cur >= tot:
-                self.total_eta_label.configure(text='')
+                self.total_eta_label.configure(text='') # 이미지 다운로드 완료 시 ETA 제거
         self.after(0, _u)
 
     @staticmethod
@@ -1009,7 +1141,7 @@ class App(tk.Tk):
         """''전체' 행에 표시되는 전체 다운로드 완료 예상 시간 업데이트."""
         def _u():
             if eta_s > 0:
-                self.total_eta_label.configure(text=f'⏱ 전체 {self._fmt_eta(eta_s)} 남음')
+                self.total_eta_label.configure(text=f'전체 {self._fmt_eta(eta_s)} 남음')
             else:
                 self.total_eta_label.configure(text='')
         self.after(0, _u)
@@ -1039,12 +1171,12 @@ class App(tk.Tk):
                 spd_txt = f'{speed_bps / 1024:.0f} KB/s'
             else:
                 spd_txt = f'{int(speed_bps)} B/s'
-            self.speed_label.configure(text=f'⚡️ {spd_txt}')
+            self.speed_label.configure(text=f'{spd_txt}')
 
             # 이미지 1개 ETA
             if speed_bps > 0 and total_b > 0:
                 self.eta_label.configure(
-                    text=f'⏱ {self._fmt_eta((total_b - downloaded) / speed_bps)} 남음')
+                    text=f'{self._fmt_eta((total_b - downloaded) / speed_bps)} 남음')
             else:
                 self.eta_label.configure(text='')
         self.after(0, _u)
@@ -1052,14 +1184,14 @@ class App(tk.Tk):
     def _set_dl(self, on):
         self._downloading = on
         if on:
-            self.dl_btn.configure(text='⏳  다운로드 중...', state='disabled',
-                                  bg='#2e3350', cursor='watch')
-            self.pause_btn.configure(state='normal', text='⏸  일시정지')
+            self.dl_btn.configure(text='다운로드 중...', state='disabled',
+                                  bg=BORDER, cursor='watch')
+            self.pause_btn.configure(state='normal', text='일시정지')
             self.stop_btn.configure(state='normal')
         else:
-            self.dl_btn.configure(text='⬇   다운로드 시작', state='normal',
-                                  bg=self.ACCENT, cursor='hand2')
-            self.pause_btn.configure(state='disabled', text='⏸  일시정지')
+            self.dl_btn.configure(text='다운로드 시작', state='normal',
+                                  bg=ACCENT, cursor='hand2')
+            self.pause_btn.configure(state='disabled', text='일시정지')
             self.stop_btn.configure(state='disabled')
             # 서브 프로그레스 정리
             self.sub_prog_var.set(0)
@@ -1069,21 +1201,26 @@ class App(tk.Tk):
 
     def _toggle_pause(self):
         if self._pause_event.is_set():
-            # 일시정지 해제 → 재개
+            # 일시정지 해제 → 계속다운
             self._pause_event.clear()
-            self.pause_btn.configure(text='⏸  일시정지', bg=self.WARN, fg='#1a1d2a')
-            self._log('[*] 다운로드 재개')
+            self.pause_btn.configure(text='일시정지', bg=WARN, fg=INPUT)
+            self._log('[*] 다운로드 계속다운')
         else:
             # 일시정지
             self._pause_event.set()
-            self.pause_btn.configure(text='▶  재개', bg=self.SUCCESS, fg='#1a1d2a')
+            self.pause_btn.configure(text='계속다운', bg=SUCCESS, fg=INPUT)
             self._log('[*] 다운로드 일시정지')
 
     def _stop_download(self):
-        if messagebox.askyesno('중지 확인', '다운로드를 중지하시겠습니까?\n(진행 중인 이미지는 차단됩니다)'):
+        if messagebox.askyesno('중지 확인', '다운로드를 중지하시겠습니까?\n(현재 작업 중인 이미지는 삭제됩니다)'):
             self._pause_event.clear()  # 일시정지 상태면 해제 후 중지
             self._stop_event.set()
             self._log('[*] 중지 요청 전송...')
+
+    def _on_closing(self):
+        """프로그램 종료 시 설정 저장."""
+        self._save_config()
+        self.destroy()
 
 
     # ── 다운로드 ─────────────────────────────────────────────────────────────
@@ -1091,13 +1228,17 @@ class App(tk.Tk):
     def _start_download(self):
         if self._downloading: return
 
-        urls       = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
+        raw_urls_text = self.url_text.get("1.0", "end-1c")
+        urls = re.split(r'[\s,]+', raw_urls_text)
+
+        urls = [u.strip() for u in urls if u.strip()]
         out        = self.dir_var.get().strip()
-        cookie_str = self.cookie_var.get().strip()
+        cookie_str = self.cookie_var.get()
         download_original = self.orig_img_var.get()
+        add_id_to_filename = self.add_id_var.get()
 
         if not urls:
-            messagebox.showwarning('입력 필요','URL을 하나 이상 입력해주세요.'); return
+            messagebox.showwarning('입력 필요', 'URL을 하나 이상 입력해주세요.'); return
         bad = [u for u in urls if not u.startswith(('http://','https://'))]
         if bad:
             messagebox.showwarning('URL 오류','잘못된 URL:\n'+'\n'.join(bad)); return
@@ -1105,7 +1246,7 @@ class App(tk.Tk):
             messagebox.showwarning('입력 필요','저장 위치를 선택해주세요.'); return
 
         self._clear_log()
-        self._set_progress(0, 0)
+        self.prog_var.set(0) # 전체 진행률 초기화
         self.prog_label.configure(text='')
         if cookie_str:
             self._log(f'[*] 쿠키 인증 활성화 ({len(cookie_str)}자)')
@@ -1121,17 +1262,23 @@ class App(tk.Tk):
 
         def _done(path, dl, tot):
             done_n[0] += 1
+            self.after(0, lambda: self.prog_var.set(done_n[0] / total_n * 100))
+            self.after(0, lambda: self.prog_label.configure(text=f'{done_n[0]} / {total_n} 완료'))
             self._log(f'[✓] ({done_n[0]}/{total_n}) 저장 완료 → {path}')
             self._log(f'    이미지: {dl} / {tot} 장')
             _check()
 
         def _err(msg):
             error_n[0] += 1; done_n[0] += 1
+            self.after(0, lambda: self.prog_var.set(done_n[0] / total_n * 100))
+            self.after(0, lambda: self.prog_label.configure(text=f'{done_n[0]} / {total_n} 완료'))
             self._log(f'[✗] 오류: {msg}')
             _check()
 
         def _check():
             if done_n[0] >= total_n:
+                self.after(0, lambda: self.prog_label.configure(text=f'총 {total_n}개 완료'))
+                self.after(0, lambda: self.total_eta_label.configure(text='')) # 전체 ETA 제거
                 def _final():
                     self._set_dl(False)
                     if error_n[0] == 0:
@@ -1139,23 +1286,85 @@ class App(tk.Tk):
                     else:
                         messagebox.showwarning('완료(일부 오류)',
                             f'{total_n}개 중 {total_n-error_n[0]}개 성공, {error_n[0]}개 실패')
+                    
+                    # 시스템 알림
+                    if self.notify_var.get():
+                        msg = (f'{total_n}개 URL 모두 저장 완료!' if error_n[0] == 0
+                               else f'{total_n-error_n[0]} / {total_n}개 성공')
+                        try:
+                            from plyer import notification
+                            notification.notify(
+                                title='아카라이브 다운로드 완료',
+                                message=msg,
+                                app_name='아카라이브 다운로더',
+                                timeout=10
+                            )
+                        except ImportError:
+                            self._log('[!] 알림 라이브러리(plyer)가 없어 시스템 알림을 표시할 수 없습니다.')
+                            self._log('    터미널: pip install plyer')
+                        except Exception as e:
+                            self._log(f'[✗] 시스템 알림 표시 실패: {e}')
                 self.after(0, _final)
 
         def _run():
+            self.after(0, lambda: self.prog_label.configure(text=f'0 / {total_n} 완료'))
+            self.after(0, lambda: self.prog_var.set(0))
+
+            # 파일 존재 여부 선확인 (ID 기반)
+            if add_id_to_filename:
+                initial_urls = []
+                for url in urls:
+                    article_id = url.split('/')[-1].split('?')[0].split('#')[0]
+                    if article_id.isdigit():
+                        # 파일명 패턴을 정확히 알 수 없으므로, ID만으로 건너뛰기
+                        # glob을 사용하여 `제목 [ID].zip` 형태의 파일 확인
+                        if list(Path(out).glob(f'* [{article_id}].zip')):
+                            self._log(f'[!] 파일이 이미 존재하여 건너뜁니다: {url}')
+                            done_n[0] += 1
+                            continue
+                    initial_urls.append(url)
+                urls = initial_urls
+
             for url in urls:
+                # 0. 중지 신호 확인
                 if self._stop_event.is_set():
                     break
                 self._log(f'\n── {url}')
+
+                # 1. 게시글 정보 미리 가져오기 (세션 생성 포함)
+                title, soup, session = _get_article_info(url, cookie_str, self._log, _err)
+                if not title or not soup or not session:
+                    continue # 실패 시 다음 URL로
+
+                # 1.5. 파일 존재 여부 미리 확인
+                filename = sanitize_filename(title)
+                if add_id_to_filename:
+                    article_id = url.split('/')[-1].split('?')[0].split('#')[0]
+                    if article_id.isdigit():
+                        filename += f' [{article_id}]'
+                zip_path = Path(out) / f'{filename}.zip'
+                if zip_path.exists():
+                    done_n[0] += 1
+                    self.after(0, lambda: self.prog_var.set(done_n[0] / total_n * 100))
+                    self.after(0, lambda: self.prog_label.configure(text=f'{done_n[0]} / {total_n} 완료'))
+                    self._log(f'[!] ({done_n[0]}/{total_n}) 이미 파일이 존재하여 건너뜁니다.')
+                    self._log(f'    → {zip_path}')
+                    _check()
+                    continue
+
+                # 2. 다운로드 실행 (가져온 정보와 세션 전달)
                 download_article(
                     url, out, self._log, self._set_progress,
-                    _done, _err,
+                    _done, _err, session, title, soup,
                     cookie_str=cookie_str,
                     download_original=download_original,
+                    add_id_to_filename=add_id_to_filename,
                     set_img_progress=self._set_img_progress,
                     set_total_eta=self._set_total_eta,
                     stop_event=self._stop_event,
                     pause_event=self._pause_event,
                 )
+
             # 루프 종료 후 완료 처리 (stop으로 조기 종료 시)
             if self._stop_event.is_set() and done_n[0] < total_n:
                 self.after(0, lambda: self._set_dl(False))
