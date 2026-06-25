@@ -1,15 +1,14 @@
 """
 arca_gui.py — 아카라이브 게시글 ZIP 저장기 (GUI, 다중 URL)
 """
-
-import io, re, copy, zipfile, threading, base64, os, time
+import io, re, copy, zipfile, threading, base64, os, time, json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+import requests # type: ignore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
@@ -33,6 +32,7 @@ DEFAULT_HEADERS = {
 MAX_WORKERS   = 3   # 미리보기 화질: 이미지 병렬 수
 FETCH_RETRY   = 10  # ArcaRefresher fetchWithRetry tryCount
 FETCH_WAIT    = 1.0 # ArcaRefresher fetchWithRetry interval (1초)
+CONFIG_PATH   = Path(__file__).parent / 'config.json'
 ICON_PATH     = Path(__file__).parent / 'arca_icon.png'
 
 # ── 다운로드 로직 ─────────────────────────────────────────────────────────────
@@ -57,8 +57,8 @@ def _make_session(base_url, cookie_str=''):
     return s
 
 def sanitize_filename(name, max_len=80):
-    name = re.sub(r'[\\/:*?"<>|]+',' ',name).strip()
-    return re.sub(r'\s+','-',name)[:max_len] or 'post'
+    name = re.sub(r'[\\/:*?"<>|]+', ' ', name).strip()
+    return name[:max_len] or 'post'
 
 def get_image_ext(src):
     try:
@@ -69,6 +69,37 @@ def get_image_ext(src):
 
 def escape_html(s):
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+
+def _get_article_info(url, cookie_str, log_func, on_error_func):
+    """주어진 URL에서 게시글 제목과 BeautifulSoup 객체를 추출합니다. 세션도 함께 반환합니다."""
+    try:
+        session = _make_session(url, cookie_str=cookie_str)
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 451:
+            on_error_func(f'HTTP 451: 법적 사유로 차단된 페이지입니다.\n'
+                          f'유효한 아카라이브 로그인 쿠키를 입력해야 접근할 수 있습니다. (URL: {url})')
+            return None, None, None # Indicate failure
+        resp.raise_for_status()
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'lxml')
+
+        # <div class="title-row"> <div class="title"> 에서 제목 추출
+        title_div = soup.select_one('div.title-row > div.title')
+        if title_div:
+            for span_tag in title_div.find_all('span'):
+                span_tag.decompose()
+            T = title_div.get_text(strip=True)
+        else:
+            og = soup.find('meta', property='og:title')
+            T  = (og.get('content','') if og else '') or (soup.title.string if soup.title else '') or 'post'
+            if ' - 아카라이브' in T:
+                T = T.split(' - 아카라이브')[0].rsplit(' - ', 1)[0]
+            T = T.strip()
+        return (T if T else 'unknown_article'), soup, session
+    except Exception as e:
+        log_func(f'[WARN] URL {url} 에서 정보 추출 실패: {e}')
+        on_error_func(f'게시글 정보 추출 중 오류 발생 (URL: {url}): {e}')
+        return None, None, None # Indicate failure
 
 # ── ArcaRefresher ImageDownloader 이식 ────────────────────────────────────────────
 #
@@ -162,26 +193,19 @@ def fetch_image(session, src, log, chunk_cb=None, stop_event=None, pause_event=N
 
 
 def download_article(url, output_dir, log, set_progress, on_done, on_error,
+                     session, pre_fetched_title, pre_fetched_soup,
                      cookie_str='', download_original=True,
-                     set_img_progress=None, set_total_eta=None,
+                     add_id_to_filename=False, set_img_progress=None, set_total_eta=None,
                      stop_event=None, pause_event=None):
     try:
-        session = _make_session(url, cookie_str=cookie_str)
         log(f'[*] 요청: {url}')
         if cookie_str.strip():
             log('    (쿠키 인증 사용 중)')
-        resp = session.get(url, timeout=10)
-        if resp.status_code == 451:
-            on_error(f'HTTP 451: 법적 사유로 차단된 페이지입니다.\n'
-                     f'유효한 아카라이브 로그인 쿠키를 입력해야 접근할 수 있습니다.')
-            return
-        resp.raise_for_status()
-        resp.encoding = 'utf-8'
-        soup = BeautifulSoup(resp.text, 'lxml')
 
-        og = soup.find('meta', property='og:title')
-        T  = (og.get('content','') if og else '') or (soup.title.string if soup.title else '') or 'post'
-        T  = T.strip()
+        T = pre_fetched_title
+        soup = pre_fetched_soup
+        if not T or not soup:
+            on_error("미리 가져온 제목 또는 soup 객체가 없습니다."); return
 
         ae = (soup.find(rel='author') or
               soup.select_one('.article-header .user,.user-info .nick,.writer,.author'))
@@ -350,7 +374,12 @@ def download_article(url, output_dir, log, set_progress, on_done, on_error,
             zf.writestr('meta.txt', '\n'.join([f'Title: {T}',f'Author: {A or "Unknown"}',
                                                f'Date: {D or "Unknown"}',f'Source: {U}',img_line]).encode('utf-8'))
 
-        out_path = Path(output_dir) / f'arca-{sanitize_filename(T)}.zip'
+        filename = sanitize_filename(T)
+        if add_id_to_filename:
+            article_id = url.split('/')[-1].split('?')[0].split('#')[0]
+            if article_id.isdigit():
+                filename += f' [{article_id}]'
+        out_path = Path(output_dir) / f'{filename}.zip'
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(zip_buf.getvalue())
         on_done(str(out_path.resolve()), len(downloaded), total)
@@ -405,6 +434,7 @@ class App(tk.Tk):
 
         self._build_styles()
         self._build_ui()
+        self._load_config() # 설정 로드 추가
 
     # ── 스타일 ───────────────────────────────────────────────────────────────
 
@@ -560,6 +590,24 @@ class App(tk.Tk):
         )
         self.orig_img_cb.pack(side='left')
 
+        settings_row2 = tk.Frame(settings_card, bg=self.CARD)
+        settings_row2.pack(fill='x', padx=14, pady=(0, 12))
+
+        self.add_id_var = tk.BooleanVar(value=False)
+        self.add_id_cb = tk.Checkbutton(
+            settings_row2,
+            text='🏷️  파일 이름에 게시글 ID 추가 (예: 제목 [12345].zip)',
+            variable=self.add_id_var,
+            bg=self.CARD,
+            fg=self.TEXT,
+            selectcolor=self.INPUT,
+            activebackground=self.CARD,
+            activeforeground=self.TEXT,
+            font=('Segoe UI', 10),
+            relief='flat', bd=0, cursor='hand2'
+        )
+        self.add_id_cb.pack(side='left')
+
         # ── 다운로드 제어 행 (시작 + 일시정지 + 중지) ──────────────────────
         ctrl_bar = tk.Frame(outer, bg=self.BG)
         ctrl_bar.pack(fill='x', pady=(0, 10))
@@ -663,6 +711,27 @@ class App(tk.Tk):
 
     # ── 헬퍼 ─────────────────────────────────────────────────────────────────
 
+    def _load_config(self):
+        """config.json 파일에서 저장된 설정을 로드합니다."""
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            cookie_str = config.get('cookie_str', '')
+            if cookie_str:
+                self.cookie_var.set(cookie_str)
+                self._set_login_status(f'✅  로그인됨 (자동)', self.SUCCESS)
+                self._log('[*] 저장된 로그인 정보로 자동 로그인했습니다.')
+        except Exception as e:
+            self._log(f'[✗] 설정 파일 로드 실패: {e}')
+
+    def _save_config(self):
+        """현재 설정을 config.json 파일에 저장합니다."""
+        config = {'cookie_str': self.cookie_var.get()}
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+
     def _section_label(self, parent, text):
         f = tk.Frame(parent, bg=self.BG)
         f.pack(fill='x', pady=(0,2))
@@ -733,6 +802,7 @@ class App(tk.Tk):
     def _clear_login(self):
         self.cookie_var.set('')
         self._set_login_status('⚪  미로그인', self.MUTED)
+        self._save_config() # 쿠키 삭제 후 설정 저장
         self._log('[*] 로그인 정보 삭제됨')
 
     def _do_login(self):
@@ -778,6 +848,7 @@ class App(tk.Tk):
                         n = len(raw)
                         def _ok(cs=cookie_str, n=n):
                             self.cookie_var.set(cs)
+                            self._save_config() # 쿠키 저장 후 설정 저장
                             self._set_login_status(f'✅  로그인됨 ({n}개)', self.SUCCESS)
                             self._log(f'[✓] 쿠키 {n}개 수집 완료 — 이제 다운로드하세요!')
                             self.login_btn.configure(state='normal', text='🔑  다시 로그인')
@@ -1091,13 +1162,20 @@ class App(tk.Tk):
     def _start_download(self):
         if self._downloading: return
 
-        urls       = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
+        raw_urls   = [v.get().strip() for _,v,_ in self._url_rows if v.get().strip()]
+        urls = []
+        for u_group in raw_urls:
+            # 쉼표, 공백, 줄바꿈으로 구분된 URL들을 분리하여 확장
+            urls.extend(re.split(r'[\s,]+', u_group))
+
+        urls = [u.strip() for u in urls if u.strip()]
         out        = self.dir_var.get().strip()
-        cookie_str = self.cookie_var.get().strip()
+        cookie_str = self.cookie_var.get()
         download_original = self.orig_img_var.get()
+        add_id_to_filename = self.add_id_var.get()
 
         if not urls:
-            messagebox.showwarning('입력 필요','URL을 하나 이상 입력해주세요.'); return
+            messagebox.showwarning('입력 필요', 'URL을 하나 이상 입력해주세요.'); return
         bad = [u for u in urls if not u.startswith(('http://','https://'))]
         if bad:
             messagebox.showwarning('URL 오류','잘못된 URL:\n'+'\n'.join(bad)); return
@@ -1143,19 +1221,43 @@ class App(tk.Tk):
 
         def _run():
             for url in urls:
+                # 0. 중지 신호 확인
                 if self._stop_event.is_set():
                     break
                 self._log(f'\n── {url}')
+
+                # 1. 게시글 정보 미리 가져오기 (세션 생성 포함)
+                title, soup, session = _get_article_info(url, cookie_str, self._log, _err)
+                if not title or not soup or not session:
+                    continue # 실패 시 다음 URL로
+
+                # 1.5. 파일 존재 여부 미리 확인
+                filename = sanitize_filename(title)
+                if add_id_to_filename:
+                    article_id = url.split('/')[-1].split('?')[0].split('#')[0]
+                    if article_id.isdigit():
+                        filename += f' [{article_id}]'
+                zip_path = Path(out) / f'{filename}.zip'
+                if zip_path.exists():
+                    done_n[0] += 1
+                    self._log(f'[!] ({done_n[0]}/{total_n}) 이미 파일이 존재하여 건너뜁니다.')
+                    self._log(f'    → {zip_path}')
+                    _check()
+                    continue
+
+                # 2. 다운로드 실행 (가져온 정보와 세션 전달)
                 download_article(
                     url, out, self._log, self._set_progress,
-                    _done, _err,
+                    _done, _err, session, title, soup,
                     cookie_str=cookie_str,
                     download_original=download_original,
+                    add_id_to_filename=add_id_to_filename,
                     set_img_progress=self._set_img_progress,
                     set_total_eta=self._set_total_eta,
                     stop_event=self._stop_event,
                     pause_event=self._pause_event,
                 )
+
             # 루프 종료 후 완료 처리 (stop으로 조기 종료 시)
             if self._stop_event.is_set() and done_n[0] < total_n:
                 self.after(0, lambda: self._set_dl(False))
